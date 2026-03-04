@@ -1,0 +1,402 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Retro Snake (Simple)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    /* Minimal retro styling */
+    body {
+      background: #111;
+      color: #ddd;
+      font-family: "Courier New", monospace;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+      margin: 0;
+    }
+
+    .container {
+      display: grid;
+      grid-template-columns: 320px 220px;
+      gap: 16px;
+      align-items: start;
+    }
+
+    canvas {
+      background: #000;
+      image-rendering: pixelated;
+      border: 4px solid #222;
+      display: block;
+    }
+
+    .panel {
+      background: #0b0b0b;
+      padding: 12px;
+      border: 2px solid #222;
+      color: #9fd;
+      min-width: 200px;
+    }
+
+    label, .score {
+      display: block;
+      margin-bottom: 8px;
+    }
+
+    input[type="range"] {
+      width: 100%;
+    }
+
+    button {
+      background: #1a1a1a;
+      color: #9fd;
+      border: 1px solid #333;
+      padding: 8px 12px;
+      cursor: pointer;
+      font-family: inherit;
+    }
+
+    button:disabled {
+      opacity: 0.5;
+      cursor: default;
+    }
+
+    .overlay {
+      position: absolute;
+      left: 0;
+      top: 0;
+      width: 100%;
+      height: 100%;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      color:#fff;
+      font-size:20px;
+      pointer-events:none;
+    }
+
+    .small {
+      font-size: 12px;
+      color: #9aa;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <!-- Game canvas -->
+    <div style="position:relative;">
+      <canvas id="game" width="320" height="320"></canvas>
+      <div id="overlay" class="overlay" style="display:none;"></div>
+    </div>
+
+    <!-- Controls and info -->
+    <div class="panel">
+      <label><strong>Speed</strong></label>
+      <input id="speed" type="range" min="1" max="10" value="5" />
+      <div class="small">1 = slowest, 10 = fastest</div>
+
+      <div style="margin-top:12px;">
+        <button id="startBtn">Start</button>
+        <button id="stopBtn" disabled>Stop</button>
+      </div>
+
+      <div style="margin-top:12px;">
+        <div class="score"><strong>Score:</strong> <span id="score">0</span></div>
+        <div class="small">Controls: <strong>W</strong> Up, <strong>A</strong> Left, <strong>D</strong> Right</div>
+        <div class="small" style="margin-top:6px;">Note: <em>S</em> (down) is intentionally not implemented.</div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    /************************************************************************
+     * Simple Retro Snake
+     *
+     * Structure:
+     *  - Game logic (state, update, collision, food)
+     *  - Rendering (draw grid, snake, food)
+     *  - Input handling (W, A, D)
+     *
+     * Grid-based movement. Head is first element of snake array.
+     ************************************************************************/
+
+    // ----- Configuration -----
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d');
+    const GRID_COLS = 16;               // grid width
+    const GRID_ROWS = 16;               // grid height
+    const CELL_SIZE = canvas.width / GRID_COLS; // pixel size per cell
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const speedInput = document.getElementById('speed');
+    const scoreEl = document.getElementById('score');
+    const overlay = document.getElementById('overlay');
+
+    // ----- Game State -----
+    let snake = [];         // array of {x,y} with head at index 0
+    let dir = { x: 1, y: 0 };// current direction vector (initially right)
+    let nextDir = { x: 1, y: 0 };// queued direction from input
+    let food = null;        // {x,y}
+    let running = false;
+    let moveInterval = 200; // ms between moves (adjusted by speed)
+    let moveTimer = 0;
+    let lastTime = 0;
+    let score = 0;
+
+    // ----- Utility helpers -----
+    function mod(n, m) { return ((n % m) + m) % m; }
+
+    // ----- Game Logic -----
+
+    // Initialize or reset the game state
+    function resetGame() {
+      // Start with a short snake in the middle, head first
+      const midX = Math.floor(GRID_COLS / 2);
+      const midY = Math.floor(GRID_ROWS / 2);
+      snake = [
+        { x: midX, y: midY },       // head
+        { x: midX - 1, y: midY },   // body
+        { x: midX - 2, y: midY }    // tail
+      ];
+      dir = { x: 1, y: 0 };
+      nextDir = { x: 1, y: 0 };
+      score = 0;
+      scoreEl.textContent = score;
+      placeFood();
+      overlay.style.display = 'none';
+    }
+
+    // Place food at a random free cell (not on the snake)
+    function placeFood() {
+      while (true) {
+        const fx = Math.floor(Math.random() * GRID_COLS);
+        const fy = Math.floor(Math.random() * GRID_ROWS);
+        const collision = snake.some(s => s.x === fx && s.y === fy);
+        if (!collision) {
+          food = { x: fx, y: fy };
+          return;
+        }
+      }
+    }
+
+    // Update game state by one step (move snake)
+    function update() {
+      // Apply queued direction if valid (no reversing)
+      if (!isOpposite(nextDir, dir)) {
+        dir = { ...nextDir };
+      }
+
+      // Compute new head position with wrapping
+      const head = snake[0];
+      const newHead = {
+        x: mod(head.x + dir.x, GRID_COLS),
+        y: mod(head.y + dir.y, GRID_ROWS)
+      };
+
+      // Check self-collision (touching any body segment)
+      const hitSelf = snake.some((seg, idx) => seg.x === newHead.x && seg.y === newHead.y);
+      if (hitSelf) {
+        endGame();
+        return;
+      }
+
+      // Add new head
+      snake.unshift(newHead);
+
+      // Check if food eaten
+      if (food && newHead.x === food.x && newHead.y === food.y) {
+        // Grow by leaving the tail in place (we already unshifted head)
+        score += 1;
+        scoreEl.textContent = score;
+        placeFood(); // spawn new food immediately
+      } else {
+        // Normal move: remove tail
+        snake.pop();
+      }
+    }
+
+    // End the game
+    function endGame() {
+      running = false;
+      overlay.style.display = 'flex';
+      overlay.textContent = 'Game Over — Score: ' + score;
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+    }
+
+    // Check if two directions are opposites
+    function isOpposite(a, b) {
+      return a.x === -b.x && a.y === -b.y;
+    }
+
+    // ----- Rendering -----
+
+    // Clear and draw the current frame
+    function render() {
+      // Clear background (retro black)
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      // Draw grid lines (very subtle)
+      ctx.strokeStyle = '#0b0b0b';
+      ctx.lineWidth = 1;
+      for (let x = 0; x <= GRID_COLS; x++) {
+        ctx.beginPath();
+        ctx.moveTo(x * CELL_SIZE, 0);
+        ctx.lineTo(x * CELL_SIZE, canvas.height);
+        ctx.stroke();
+      }
+      for (let y = 0; y <= GRID_ROWS; y++) {
+        ctx.beginPath();
+        ctx.moveTo(0, y * CELL_SIZE);
+        ctx.lineTo(canvas.width, y * CELL_SIZE);
+        ctx.stroke();
+      }
+
+      // Draw food (dot)
+      if (food) {
+        ctx.fillStyle = '#ff4444';
+        drawCell(food.x, food.y);
+      }
+
+      // Draw snake: head brighter
+      for (let i = snake.length - 1; i >= 0; i--) {
+        const seg = snake[i];
+        if (i === 0) {
+          ctx.fillStyle = '#9aff9a'; // head
+        } else {
+          ctx.fillStyle = '#2ecc40'; // body
+        }
+        drawCell(seg.x, seg.y);
+      }
+    }
+
+    // Draw a single grid cell (filled rectangle)
+    function drawCell(gx, gy) {
+      ctx.fillRect(gx * CELL_SIZE + 1, gy * CELL_SIZE + 1, CELL_SIZE - 2, CELL_SIZE - 2);
+    }
+
+    // ----- Input Handling -----
+
+    // Map keys to direction vectors
+    const KEY_DIR = {
+      'w': { x: 0, y: -1 },
+      'a': { x: -1, y: 0 },
+      'd': { x: 1, y: 0 }
+    };
+
+    // Handle keydown events
+    function onKeyDown(e) {
+      if (!running) return;
+      const k = e.key.toLowerCase();
+      if (k in KEY_DIR) {
+        const desired = KEY_DIR[k];
+        // Prevent reversing direction
+        if (!isOpposite(desired, dir)) {
+          nextDir = desired;
+        }
+      }
+    }
+
+    // ----- Game Loop -----
+
+    // Convert speed slider (1..10) to interval ms (1 slowest -> large ms)
+    function speedToInterval(speed) {
+      // speed 1 => 300ms, speed 10 => 75ms
+      return 300 - (speed - 1) * 25;
+    }
+
+    function gameLoop(timestamp) {
+      if (!lastTime) lastTime = timestamp;
+      const delta = timestamp - lastTime;
+      lastTime = timestamp;
+
+      if (running) {
+        moveTimer += delta;
+        if (moveTimer >= moveInterval) {
+          moveTimer = 0;
+          update();
+        }
+      }
+
+      render();
+      requestAnimationFrame(gameLoop);
+    }
+
+    // ----- Controls: Start / Stop -----
+    function startGame() {
+      resetGame();
+      const speed = parseInt(speedInput.value, 10);
+      moveInterval = speedToInterval(speed);
+      running = true;
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+      lastTime = 0;
+      moveTimer = 0;
+      overlay.style.display = 'none';
+    }
+
+    function stopGame() {
+      running = false;
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+      overlay.style.display = 'flex';
+      overlay.textContent = 'Paused';
+    }
+
+    // ----- Event wiring -----
+    window.addEventListener('keydown', onKeyDown);
+    startBtn.addEventListener('click', () => {
+      startGame();
+    });
+    stopBtn.addEventListener('click', () => {
+      stopGame();
+    });
+
+    // Update speed while running (applies immediately)
+    speedInput.addEventListener('input', () => {
+      const speed = parseInt(speedInput.value, 10);
+      moveInterval = speedToInterval(speed);
+    });
+
+    // Initialize and start the render loop (not the game)
+    resetGame();
+    requestAnimationFrame(gameLoop);
+
+    // Minimal touch support: tap left/right/up areas on canvas to simulate keys
+    // (keeps interface usable on mobile without adding extra UI)
+    canvas.addEventListener('click', (ev) => {
+      // Only accept clicks while running
+      if (!running) return;
+      const rect = canvas.getBoundingClientRect();
+      const x = ev.clientX - rect.left;
+      const y = ev.clientY - rect.top;
+      const cx = canvas.width / 2;
+      const cy = canvas.height / 2;
+      // Determine quadrant relative to center: left, right, up
+      if (x < cx * 0.6) {
+        // left area -> A
+        const desired = KEY_DIR['a'];
+        if (!isOpposite(desired, dir)) nextDir = desired;
+      } else if (x > cx * 1.4) {
+        // right area -> D
+        const desired = KEY_DIR['d'];
+        if (!isOpposite(desired, dir)) nextDir = desired;
+      } else if (y < cy * 0.6) {
+        // top area -> W
+        const desired = KEY_DIR['w'];
+        if (!isOpposite(desired, dir)) nextDir = desired;
+      }
+    });
+
+    // Prevent arrow keys from scrolling the page while playing
+    window.addEventListener('keydown', (e) => {
+      if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].includes(e.key)) {
+        e.preventDefault();
+      }
+    }, { passive: false });
+
+  </script>
+</body>
+</html>
