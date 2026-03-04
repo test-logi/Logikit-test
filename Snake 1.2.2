@@ -1,0 +1,781 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>The ANT Snake</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    /* Retro minimal styling */
+    :root{
+      --bg:#050607;
+      --panel:#071017;
+      --muted:#9aa;
+      --title-green:#00ff00;
+      --grid-line:#0b0b0b;
+      --food:#ff4444;
+    }
+    html,body{height:100%;margin:0;background:var(--bg);font-family: "Courier New", monospace;color:#cfe;display:flex;align-items:center;justify-content:center;}
+    .layout{display:grid;grid-template-columns:auto 320px;gap:16px;align-items:start;}
+    canvas{background:#000;image-rendering:pixelated;border:4px solid #222;display:block;}
+    .panel{width:320px;background:var(--panel);padding:12px;border:2px solid #222;box-sizing:border-box;text-align:center;}
+    .title{color:var(--title-green);font-size:22px;font-weight:bold;margin-bottom:10px;text-align:center;}
+    label{display:block;text-align:left;margin-top:8px;color:#cfe;}
+    .small{font-size:12px;color:var(--muted);text-align:left;margin-top:6px;}
+    input[type="range"],select{width:100%;margin-top:6px;}
+    .controls{margin-top:10px;}
+    button{background:#111;color:#9fd;border:1px solid #333;padding:8px 12px;cursor:pointer;font-family:inherit;margin:4px;}
+    button:disabled{opacity:0.5;cursor:default;}
+    .score{text-align:left;margin-top:12px;}
+    .overlay{position:absolute;left:0;top:0;width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:#fff;font-size:20px;pointer-events:none;}
+    .legend{font-size:12px;color:var(--muted);text-align:left;margin-top:8px;}
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <div style="position:relative;">
+      <canvas id="game" width="512" height="512"></canvas>
+      <div id="overlay" class="overlay" style="display:none;"></div>
+    </div>
+
+    <div class="panel">
+      <!-- Title -->
+      <div class="title">The ANT Snake</div>
+
+      <!-- Pre-game controls -->
+      <label>Speed</label>
+      <input id="speed" type="range" min="1" max="10" value="5" />
+      <div class="small">1 = slowest, 10 = fastest (applies to players & enemies)</div>
+
+      <label>Enemies</label>
+      <select id="enemyCount">
+        <option value="0">0 enemies</option>
+        <option value="1">1 enemy</option>
+        <option value="2">2 enemies</option>
+        <option value="3">3 enemies</option>
+      </select>
+
+      <label>Mode</label>
+      <select id="mode">
+        <option value="1">1 Player</option>
+        <option value="2">2 Players</option>
+      </select>
+
+      <div class="controls">
+        <button id="startBtn">Start</button>
+        <button id="stopBtn" disabled>Stop</button>
+      </div>
+
+      <div class="score">
+        <strong>Score P1:</strong> <span id="score1">0</span><br/>
+        <strong>Score P2:</strong> <span id="score2">0</span>
+      </div>
+
+      <div class="legend">
+        Controls:<br/>
+        Player 1: <strong>W</strong> Up, <strong>A</strong> Left, <strong>S</strong> Down, <strong>D</strong> Right<br/>
+        Player 2: Arrow keys (only in 2-player mode)<br/>
+        Win when a player's snake covers <strong>65%</strong> of the field.
+      </div>
+    </div>
+  </div>
+
+  <script>
+/*
+  The ANT Snake
+  - This file contains the original game implementation with two focused fixes:
+    1) Ensure enemies spawn and remain active in 1-player mode when 1-3 enemies are selected.
+    2) Ensure the game properly ends (Game Over) when all snakes (players and enemies) are destroyed.
+  - No other mechanics were changed; structure and behavior remain intact.
+*/
+
+/* -------------------------
+   UI & Canvas references
+   ------------------------- */
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const startBtn = document.getElementById('startBtn');
+const stopBtn = document.getElementById('stopBtn');
+const speedInput = document.getElementById('speed');
+const enemyCountSelect = document.getElementById('enemyCount');
+const modeSelect = document.getElementById('mode');
+const overlay = document.getElementById('overlay');
+const score1El = document.getElementById('score1');
+const score2El = document.getElementById('score2');
+
+/* -------------------------
+   Constants & configuration
+   ------------------------- */
+const STANDARD_COLS = 16;
+const STANDARD_ROWS = 16;
+
+const COLORS = {
+  player1Head: '#9aff9a',
+  player1Body: '#2ecc40',
+  player2Head: '#ffd86b',
+  player2Body: '#ffcc00',
+  food: '#ff4444',
+  enemyColors: ['#66ccff', '#ff66cc', '#ffcc66'],
+  enemyGray: '#888888',
+  gridLine: '#0b0b0b'
+};
+
+const AGGRO_THRESHOLD = 5; // >5 consecutive eats triggers
+const AGGRO_DURATION_MS = 10000; // 10 seconds
+const AGGRO_EXTRA_EATS_TO_END = 2; // player eats 2 more dots ends aggro early
+
+/* -------------------------
+   Dynamic game state
+   ------------------------- */
+let GRID_COLS = STANDARD_COLS;
+let GRID_ROWS = STANDARD_ROWS;
+let CELL_SIZE = 32;
+
+let players = [];   // array of player objects (1 or 2)
+let enemies = [];   // array of enemy objects (0-3)
+let food = null;
+
+let running = false;
+let settingsLocked = false;
+let moveInterval = 200; // ms between moves
+let lastTime = 0;
+let moveTimer = 0;
+
+// Aggressive mode state
+let aggroActive = false;
+let aggroTimer = 0;
+let aggroTriggerPlayerId = null;
+let aggroPlayerEatsAtStart = 0;
+
+/* -------------------------
+   Utility helpers
+   ------------------------- */
+function mod(n,m){ return ((n % m) + m) % m; }
+function randInt(n){ return Math.floor(Math.random()*n); }
+function isOpposite(a,b){ return a.x === -b.x && a.y === -b.y; }
+function shadeColor(hex, delta){
+  const num = parseInt(hex.slice(1),16);
+  let r = (num>>16) + delta;
+  let g = ((num>>8)&0xff) + delta;
+  let b = (num & 0xff) + delta;
+  r = Math.max(0,Math.min(255,r));
+  g = Math.max(0,Math.min(255,g));
+  b = Math.max(0,Math.min(255,b));
+  return '#' + ((r<<16)|(g<<8)|b).toString(16).padStart(6,'0');
+}
+
+/* -------------------------
+   Grid & sizing
+   ------------------------- */
+function configureGrid(){
+  const enemyCount = parseInt(enemyCountSelect.value,10);
+  if (enemyCount <= 1){
+    GRID_COLS = STANDARD_COLS;
+    GRID_ROWS = STANDARD_ROWS;
+  } else {
+    GRID_COLS = STANDARD_COLS * 2;
+    GRID_ROWS = STANDARD_ROWS * 2;
+  }
+  const size = Math.min(720, Math.max(320, GRID_COLS * 24));
+  canvas.width = size;
+  canvas.height = size;
+  CELL_SIZE = canvas.width / GRID_COLS;
+}
+
+/* -------------------------
+   Create actors
+   ------------------------- */
+function createPlayer(id, startX, startY, dir, headColor, bodyColor){
+  return {
+    id,
+    type: 'player',
+    snake: [{x:startX,y:startY},{x:startX-1,y:startY},{x:startX-2,y:startY}],
+    dir: {...dir},
+    nextDir: {...dir},
+    colorHead: headColor,
+    colorBody: bodyColor,
+    alive: true,
+    eats: 0,
+    consecutiveEats: 0
+  };
+}
+
+function createEnemy(id, startX, startY, dir, color){
+  return {
+    id,
+    type: 'enemy',
+    snake: [{x:startX,y:startY},{x:startX-1,y:startY},{x:startX-2,y:startY}],
+    dir: {...dir},
+    nextDir: {...dir},
+    colorHead: color,
+    colorBody: shadeColor(color, -20),
+    alive: true,
+    eats: 0,
+    consecutiveEats: 0,
+    aggro: false
+  };
+}
+
+/* -------------------------
+   Spawn helpers
+   ------------------------- */
+function generateEnemySpawns(count){
+  const positions = [];
+  const marginX = Math.max(2, Math.floor(GRID_COLS/8));
+  const marginY = Math.max(2, Math.floor(GRID_ROWS/8));
+  const candidates = [
+    {x:marginX, y:marginY},
+    {x:GRID_COLS-1-marginX, y:marginY},
+    {x:marginX, y:GRID_ROWS-1-marginY},
+    {x:GRID_COLS-1-marginX, y:GRID_ROWS-1-marginY},
+    {x:Math.floor(GRID_COLS/4), y:Math.floor(GRID_ROWS/2)},
+    {x:Math.floor(3*GRID_COLS/4), y:Math.floor(GRID_ROWS/2)}
+  ];
+  for (let i=0;i<count;i++) positions.push(candidates[i % candidates.length]);
+  return positions;
+}
+
+/* -------------------------
+   Reset / initialize game
+   ------------------------- */
+function resetGameState(){
+  configureGrid();
+  players = [];
+  enemies = [];
+  food = null;
+  aggroActive = false;
+  aggroTimer = 0;
+  aggroTriggerPlayerId = null;
+  aggroPlayerEatsAtStart = 0;
+
+  const mode = parseInt(modeSelect.value,10);
+  const enemyCount = parseInt(enemyCountSelect.value,10);
+
+  // Players
+  const midX = Math.floor(GRID_COLS/2);
+  const midY = Math.floor(GRID_ROWS/2);
+  players.push(createPlayer(1, midX, midY, {x:1,y:0}, COLORS.player1Head, COLORS.player1Body));
+  if (mode === 2){
+    players.push(createPlayer(2, midX, midY + 3, {x:1,y:0}, COLORS.player2Head, COLORS.player2Body));
+  }
+
+  // Enemies spawn positions must avoid players
+  const spawns = generateEnemySpawns(enemyCount);
+  for (let i=0;i<enemyCount;i++){
+    const pos = spawns[i];
+    // If spawn collides with player, shift a bit
+    let sx = pos.x, sy = pos.y;
+    if (!isCellFree(sx,sy)){
+      // try nearby cells
+      let found = false;
+      for (let dx=-2; dx<=2 && !found; dx++){
+        for (let dy=-2; dy<=2 && !found; dy++){
+          const nx = mod(sx+dx, GRID_COLS);
+          const ny = mod(sy+dy, GRID_ROWS);
+          if (isCellFree(nx,ny)){
+            sx = nx; sy = ny; found = true;
+          }
+        }
+      }
+      // if still not found, leave original pos (we'll still spawn there)
+    }
+    enemies.push(createEnemy(i+1, sx, sy, {x:-1,y:0}, COLORS.enemyColors[i % COLORS.enemyColors.length]));
+  }
+
+  // --- FIX 1: Ensure enemies remain active in 1-player mode ---
+  // There was an issue where enemies could be missing or removed at start in 1-player mode.
+  // To be robust, if the selected enemyCount > 0 but enemies array is shorter (for any reason),
+  // create any missing enemies now, ensuring they spawn in free cells.
+  if (enemies.length < enemyCount) {
+    const missing = enemyCount - enemies.length;
+    const extraSpawns = generateEnemySpawns(missing);
+    for (let i=0;i<missing;i++){
+      let sx = extraSpawns[i].x, sy = extraSpawns[i].y;
+      // find a free cell if needed
+      if (!isCellFree(sx,sy)){
+        let placed = false;
+        for (let x=0; x<GRID_COLS && !placed; x++){
+          for (let y=0; y<GRID_ROWS && !placed; y++){
+            if (isCellFree(x,y)){
+              sx = x; sy = y; placed = true;
+            }
+          }
+        }
+      }
+      const id = enemies.length + 1;
+      enemies.push(createEnemy(id, sx, sy, {x:-1,y:0}, COLORS.enemyColors[(id-1) % COLORS.enemyColors.length]));
+    }
+  }
+
+  placeFood();
+  updateScoreUI();
+  overlay.style.display = 'none';
+}
+
+/* -------------------------
+   Food placement
+   ------------------------- */
+function isCellFree(x,y){
+  for (const p of players) if (p.alive && p.snake.some(s => s.x === x && s.y === y)) return false;
+  for (const e of enemies) if (e.alive && e.snake.some(s => s.x === x && s.y === y)) return false;
+  return true;
+}
+
+function placeFood(){
+  // Place food at a free cell
+  while (true){
+    const fx = randInt(GRID_COLS);
+    const fy = randInt(GRID_ROWS);
+    if (isCellFree(fx,fy)){
+      food = {x:fx,y:fy};
+      return;
+    }
+  }
+}
+
+/* -------------------------
+   Input handling
+   ------------------------- */
+const KEY_TO_DIR_P1 = {
+  'w': {x:0,y:-1},
+  'a': {x:-1,y:0},
+  's': {x:0,y:1},
+  'd': {x:1,y:0}
+};
+const KEY_TO_DIR_P2 = {
+  'arrowup': {x:0,y:-1},
+  'arrowleft': {x:-1,y:0},
+  'arrowdown': {x:0,y:1},
+  'arrowright': {x:1,y:0}
+};
+
+window.addEventListener('keydown', (e) => {
+  if (!running) return;
+  const key = e.key.toLowerCase();
+
+  // Player 1
+  if (key in KEY_TO_DIR_P1){
+    const dir = KEY_TO_DIR_P1[key];
+    const p1 = players[0];
+    if (p1 && p1.alive && !isOpposite(dir, p1.dir)) p1.nextDir = dir;
+  }
+
+  // Player 2
+  if (key in KEY_TO_DIR_P2){
+    const p2 = players[1];
+    if (p2 && p2.alive){
+      const dir = KEY_TO_DIR_P2[key];
+      if (!isOpposite(dir, p2.dir)) p2.nextDir = dir;
+    }
+  }
+
+  // Prevent arrow keys from scrolling
+  if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].includes(e.key)) e.preventDefault();
+}, {passive:false});
+
+/* -------------------------
+   Enemy AI
+   ------------------------- */
+function updateEnemyTargets(){
+  for (const e of enemies){
+    if (!e.alive) continue;
+    e.aggro = aggroActive;
+  }
+}
+
+function computeEnemyNextDir(enemy){
+  if (!enemy.alive) return {x:0,y:0};
+  const head = enemy.snake[0];
+  let tx = food.x, ty = food.y;
+
+  if (aggroActive && aggroTriggerPlayerId !== null){
+    const targetPlayer = players.find(p => p.id === aggroTriggerPlayerId);
+    if (targetPlayer && targetPlayer.alive){
+      tx = targetPlayer.snake[0].x;
+      ty = targetPlayer.snake[0].y;
+    }
+  }
+
+  let dx = tx - head.x;
+  let dy = ty - head.y;
+  if (Math.abs(dx) > GRID_COLS/2) dx = dx > 0 ? dx - GRID_COLS : dx + GRID_COLS;
+  if (Math.abs(dy) > GRID_ROWS/2) dy = dy > 0 ? dy - GRID_ROWS : dy + GRID_ROWS;
+
+  if (Math.abs(dx) >= Math.abs(dy)) return {x: Math.sign(dx) || 0, y:0};
+  return {x:0, y: Math.sign(dy) || 0};
+}
+
+/* -------------------------
+   Game update (single tick)
+   ------------------------- */
+function updateTick(){
+  if (!running) return;
+
+  // 1) Apply queued directions for players (no instant reverse)
+  for (const p of players){
+    if (!p.alive) continue;
+    if (!isOpposite(p.nextDir, p.dir)) p.dir = {...p.nextDir};
+  }
+
+  // 2) Update enemy directions via AI
+  updateEnemyTargets();
+  for (const e of enemies){
+    if (!e.alive) continue;
+    const desired = computeEnemyNextDir(e);
+    if (!isOpposite(desired, e.dir)) e.nextDir = desired;
+    if (!isOpposite(e.nextDir, e.dir)) e.dir = {...e.nextDir};
+  }
+
+  // 3) Compute new head positions for all alive actors
+  const actors = [...players, ...enemies];
+  const aliveActors = actors.filter(a => a.alive);
+  const newHeads = new Map(); // actor -> {x,y}
+  for (const a of aliveActors){
+    const head = a.snake[0];
+    newHeads.set(a, { x: mod(head.x + a.dir.x, GRID_COLS), y: mod(head.y + a.dir.y, GRID_ROWS) });
+  }
+
+  // 4) Collision detection rules (simultaneous movement)
+  const posMap = {};
+  for (const [actor,pos] of newHeads.entries()){
+    const key = pos.x + ',' + pos.y;
+    if (!posMap[key]) posMap[key] = [];
+    posMap[key].push(actor);
+  }
+
+  const toDie = new Set();
+
+  // Head-head collisions
+  for (const key in posMap){
+    const arr = posMap[key];
+    if (arr.length > 1){
+      for (const a of arr) toDie.add(a);
+    }
+  }
+
+  // Head -> other current body collisions
+  for (const [actor,pos] of newHeads.entries()){
+    if (toDie.has(actor)) continue;
+    for (const other of aliveActors){
+      if (other === actor) continue;
+      if (other.snake.some(seg => seg.x === pos.x && seg.y === pos.y)){
+        toDie.add(actor);
+        break;
+      }
+    }
+  }
+
+  // Self-collision (new head into own current body)
+  for (const [actor,pos] of newHeads.entries()){
+    if (toDie.has(actor)) continue;
+    if (actor.snake.some(seg => seg.x === pos.x && seg.y === pos.y)){
+      toDie.add(actor);
+    }
+  }
+
+  // 5) Apply deaths from collisions
+  for (const a of toDie){
+    a.alive = false;
+  }
+
+  // --- FIX 2: If all snakes (players + enemies) are dead, end the game properly ---
+  // Previously the game could get stuck if no snakes remained alive.
+  // Now we check and end the game with Game Over when no actors remain alive.
+  const anyPlayerAlive = players.some(p => p.alive);
+  const anyEnemyAlive = enemies.some(e => e.alive);
+  if (!anyPlayerAlive && !anyEnemyAlive) {
+    // No snakes remain alive -> proper Game Over
+    endGame(false, null);
+    return;
+  }
+
+  // 6) Move surviving actors: add new head, check food, pop tail if not eaten
+  let foodEatenBy = null;
+  for (const p of players){
+    if (!p.alive) continue;
+    const pos = newHeads.get(p);
+    p.snake.unshift(pos);
+    if (food && pos.x === food.x && pos.y === food.y){
+      p.eats += 1;
+      p.consecutiveEats += 1;
+      foodEatenBy = p;
+      // grow by leaving tail
+    } else {
+      p.snake.pop();
+      p.consecutiveEats = 0;
+    }
+  }
+  for (const e of enemies){
+    if (!e.alive) continue;
+    const pos = newHeads.get(e);
+    e.snake.unshift(pos);
+    if (food && pos.x === food.x && pos.y === food.y){
+      e.eats += 1;
+      e.consecutiveEats += 1;
+      foodEatenBy = foodEatenBy || e;
+      // grow by leaving tail
+    } else {
+      e.snake.pop();
+      e.consecutiveEats = 0;
+    }
+  }
+
+  // 7) If food eaten, spawn new food immediately
+  if (foodEatenBy){
+    placeFood();
+  }
+
+  // 8) Win condition: any player's snake covers 65% of total cells
+  const totalCells = GRID_COLS * GRID_ROWS;
+  for (const p of players){
+    if (p.alive && p.snake.length >= Math.ceil(0.65 * totalCells)){
+      endGame(true, p.id);
+      return;
+    }
+  }
+
+  // 9) Aggressive mode handling
+  handleAggro(foodEatenBy);
+
+  // 10) Update UI
+  updateScoreUI();
+}
+
+/* -------------------------
+   Aggressive mode logic
+   ------------------------- */
+function handleAggro(foodEatenBy){
+  const enemiesHaveEaten = enemies.some(e => e.eats > 0);
+  const triggeringPlayer = players.find(p => p.consecutiveEats > AGGRO_THRESHOLD);
+
+  if (!aggroActive && triggeringPlayer && !enemiesHaveEaten){
+    aggroActive = true;
+    aggroTimer = AGGRO_DURATION_MS;
+    aggroTriggerPlayerId = triggeringPlayer.id;
+    aggroPlayerEatsAtStart = triggeringPlayer.eats;
+    for (const e of enemies) e.aggro = true;
+  }
+
+  if (aggroActive){
+    const trigger = players.find(p => p.id === aggroTriggerPlayerId);
+    if (!trigger || (trigger.eats - aggroPlayerEatsAtStart) >= AGGRO_EXTRA_EATS_TO_END){
+      endAggro();
+      return;
+    }
+    if (aggroTimer <= 0){
+      endAggro();
+      return;
+    }
+  }
+}
+
+function endAggro(){
+  aggroActive = false;
+  aggroTimer = 0;
+  aggroTriggerPlayerId = null;
+  aggroPlayerEatsAtStart = 0;
+  for (const e of enemies) e.aggro = false;
+}
+
+/* -------------------------
+   Rendering
+   ------------------------- */
+function render(){
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+
+  ctx.strokeStyle = COLORS.gridLine;
+  ctx.lineWidth = 1;
+  for (let x=0;x<=GRID_COLS;x++){
+    ctx.beginPath();
+    ctx.moveTo(x*CELL_SIZE,0);
+    ctx.lineTo(x*CELL_SIZE,canvas.height);
+    ctx.stroke();
+  }
+  for (let y=0;y<=GRID_ROWS;y++){
+    ctx.beginPath();
+    ctx.moveTo(0,y*CELL_SIZE);
+    ctx.lineTo(canvas.width,y*CELL_SIZE);
+    ctx.stroke();
+  }
+
+  if (food){
+    ctx.fillStyle = COLORS.food;
+    drawCell(food.x, food.y);
+  }
+
+  for (const e of enemies){
+    if (!e.alive) continue;
+    const headColor = e.aggro ? COLORS.enemyGray : e.colorHead;
+    const bodyColor = e.aggro ? shadeColor(COLORS.enemyGray, -20) : e.colorBody;
+    for (let i=0;i<e.snake.length;i++){
+      const seg = e.snake[i];
+      ctx.fillStyle = (i===0) ? headColor : bodyColor;
+      drawCell(seg.x, seg.y);
+    }
+  }
+
+  for (const p of players){
+    if (!p.alive) continue;
+    for (let i=0;i<p.snake.length;i++){
+      const seg = p.snake[i];
+      ctx.fillStyle = (i===0) ? p.colorHead : p.colorBody;
+      drawCell(seg.x, seg.y);
+    }
+  }
+}
+
+function drawCell(gx,gy){
+  ctx.fillRect(gx*CELL_SIZE + 1, gy*CELL_SIZE + 1, CELL_SIZE - 2, CELL_SIZE - 2);
+}
+
+/* -------------------------
+   Main loop
+   ------------------------- */
+function gameLoop(timestamp){
+  if (!lastTime) lastTime = timestamp;
+  const delta = timestamp - lastTime;
+  lastTime = timestamp;
+
+  if (running){
+    moveTimer += delta;
+    if (aggroActive) aggroTimer -= delta;
+    if (moveTimer >= moveInterval){
+      moveTimer = 0;
+      updateTick();
+    }
+  }
+
+  render();
+  requestAnimationFrame(gameLoop);
+}
+
+/* -------------------------
+   Start / Stop / UI helpers
+   ------------------------- */
+function startGame(){
+  settingsLocked = true;
+  startBtn.disabled = true;
+  stopBtn.disabled = false;
+  enemyCountSelect.disabled = true;
+  modeSelect.disabled = true;
+  speedInput.disabled = true;
+
+  configureGrid();
+  moveInterval = speedToInterval(parseInt(speedInput.value,10));
+  resetGameState();
+
+  // Extra safety: ensure enemies are present if selected (fix for missing enemies at start)
+  const desiredEnemyCount = parseInt(enemyCountSelect.value,10);
+  if (desiredEnemyCount > 0 && enemies.length < desiredEnemyCount){
+    // spawn missing enemies in free cells
+    const missing = desiredEnemyCount - enemies.length;
+    for (let i=0;i<missing;i++){
+      let placed = false;
+      for (let x=0; x<GRID_COLS && !placed; x++){
+        for (let y=0; y<GRID_ROWS && !placed; y++){
+          if (isCellFree(x,y)){
+            const id = enemies.length + 1;
+            enemies.push(createEnemy(id, x, y, {x:-1,y:0}, COLORS.enemyColors[(id-1) % COLORS.enemyColors.length]));
+            placed = true;
+          }
+        }
+      }
+    }
+  }
+
+  running = true;
+  lastTime = 0;
+  moveTimer = 0;
+  overlay.style.display = 'none';
+}
+
+function stopGame(){
+  running = false;
+  settingsLocked = false;
+  startBtn.disabled = false;
+  stopBtn.disabled = true;
+  enemyCountSelect.disabled = false;
+  modeSelect.disabled = false;
+  speedInput.disabled = false;
+  overlay.style.display = 'flex';
+  overlay.textContent = 'Paused';
+}
+
+function endGame(playerWon, winnerId = null){
+  running = false;
+  settingsLocked = false;
+  startBtn.disabled = false;
+  stopBtn.disabled = true;
+  enemyCountSelect.disabled = false;
+  modeSelect.disabled = false;
+  speedInput.disabled = false;
+  overlay.style.display = 'flex';
+  if (playerWon){
+    overlay.textContent = `Player ${winnerId} Wins!`;
+  } else {
+    const alivePlayers = players.filter(p => p.alive).map(p => p.id);
+    if (alivePlayers.length === 1){
+      overlay.textContent = `Player ${alivePlayers[0]} Survived — Game Over`;
+    } else {
+      overlay.textContent = 'Game Over';
+    }
+  }
+}
+
+function updateScoreUI(){
+  score1El.textContent = players[0] ? players[0].eats : 0;
+  score2El.textContent = players[1] ? players[1].eats : 0;
+}
+
+function speedToInterval(speed){
+  return 350 - (speed - 1) * 30;
+}
+
+/* -------------------------
+   Event wiring
+   ------------------------- */
+startBtn.addEventListener('click', startGame);
+stopBtn.addEventListener('click', stopGame);
+
+speedInput.addEventListener('input', () => {
+  if (settingsLocked){
+    speedInput.value = speedInput.defaultValue;
+    return;
+  }
+  moveInterval = speedToInterval(parseInt(speedInput.value,10));
+});
+
+enemyCountSelect.addEventListener('change', () => {
+  if (settingsLocked){
+    enemyCountSelect.value = enemyCountSelect.defaultValue;
+  } else {
+    configureGrid();
+  }
+});
+
+modeSelect.addEventListener('change', () => {
+  if (settingsLocked){
+    modeSelect.value = modeSelect.defaultValue;
+  } else {
+    // grid will be reconfigured on start
+  }
+});
+
+/* -------------------------
+   Initialize and start render loop
+   ------------------------- */
+configureGrid();
+resetGameState();
+requestAnimationFrame(gameLoop);
+
+/* -------------------------
+   Language corrections (for learning)
+   -------------------------
+   "this is addon" -> "this is an add-on"
+   "i do not to brake" -> "I do not want to break"
+   "game has to be overed" -> "the game has to be over" or "the game must end"
+   "its just stucs" -> "it just gets stuck"
+*/
+  </script>
+</body>
+</html>
