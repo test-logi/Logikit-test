@@ -1,0 +1,417 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>The ANT Snake — A-Frame 3D (Full Script)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <script src="https://aframe.io/releases/1.4.2/aframe.min.js"></script>
+  <script src="https://unpkg.com/simplex-noise@2.4.0/simplex-noise.min.js"></script>
+  <style>
+    body { margin: 0; background: #00131f; font-family: "Courier New", monospace; }
+    .hint { position: absolute; left: 12px; bottom: 12px; color: #9fd; font-size: 13px; z-index: 10; }
+  </style>
+</head>
+<body>
+  <div class="hint">Drag to orbit, scroll to zoom. Click UI panels to interact.</div>
+
+  <a-scene background="color: #001a33" vr-mode-ui="enabled: false" renderer="antialias: true">
+    <!-- Ocean-like skybox (large sphere with animated material) -->
+    <a-entity id="ocean" geometry="primitive: sphere; radius: 5000; segmentsWidth: 32; segmentsHeight: 32"
+              material="shader: flat; color: #002b55; side: back; opacity: 0.98"
+              ocean-shader></a-entity>
+
+    <!-- Lights -->
+    <a-entity light="type: ambient; intensity: 0.6"></a-entity>
+    <a-entity light="type: directional; intensity: 0.9" position="1 2 1"></a-entity>
+
+    <!-- Land sphere (coffee brown) with bumpiness -->
+    <a-entity id="land" geometry="primitive: sphere; radius: 3; segmentsWidth: 128; segmentsHeight: 128"
+              material="color: #6b4b2b; metalness:0.1; roughness:0.9; shader: standard"
+              bumpy-sphere></a-entity>
+
+    <!-- Container for all dynamic actors (snakes, food) -->
+    <a-entity id="actors"></a-entity>
+
+    <!-- UI Panel group (in-scene) -->
+    <a-entity id="uiRoot" position="-1.6 1.6 -3" rotation="0 15 0">
+      <a-plane width="1.6" height="1.9" color="#071017" material="opacity:0.95"></a-plane>
+      <a-text value="The ANT Snake" color="#00ff00" align="center" position="0 0.78 0.01" width="1.4" wrap-count="18" ></a-text>
+
+      <a-text value="Speed (1-10)" color="#cfe" align="left" position="-0.7 0.58 0.01" width="1.4"></a-text>
+      <a-entity id="speedSlider" position="0 0.48 0.02" ui-slider="min:1;max:10;value:5"></a-entity>
+
+      <a-text value="Enemies (0-3)" color="#cfe" align="left" position="-0.7 0.28 0.01" width="1.4"></a-text>
+      <a-entity id="enemySelector" position="0 0.18 0.02" ui-select="options:0,1,2,3;value:1"></a-entity>
+
+      <a-text value="Mode" color="#cfe" align="left" position="-0.7 -0.02 0.01" width="1.4"></a-text>
+      <a-entity id="modeSelector" position="0 -0.12 0.02" ui-select="options:1,2;labels:1 Player,2 Players;value:1"></a-entity>
+
+      <a-entity id="buttons" position="0 -0.44 0.02">
+        <a-box id="startBtn" depth="0.04" height="0.18" width="0.7" color="#111" position="-0.4 0 0" class="clickable ui"></a-box>
+        <a-text value="Start" color="#9fd" align="center" position="-0.4 0 0.03" width="0.6"></a-text>
+
+        <a-box id="stopBtn" depth="0.04" height="0.18" width="0.7" color="#333" position="0.4 0 0" class="clickable ui"></a-box>
+        <a-text value="Stop" color="#9fd" align="center" position="0.4 0 0.03" width="0.6"></a-text>
+      </a-entity>
+
+      <a-text id="scoreText" value="Score P1: 0   P2: 0" color="#cfe" align="left" position="-0.7 -0.78 0.01" width="1.4"></a-text>
+      <a-text value="Controls: P1 W A S D  P2 Arrows" color="#9aa" align="left" position="-0.7 -1.02 0.01" width="1.4"></a-text>
+      <a-text value="Win: cover 65% of sphere" color="#9aa" align="left" position="-0.7 -1.18 0.01" width="1.4"></a-text>
+    </a-entity>
+
+    <!-- Camera rig with improved orbit-camera component -->
+    <a-entity id="cameraRig" position="0 0 8" orbit-camera>
+      <a-entity camera look-controls="enabled:false"></a-entity>
+      <a-entity cursor="fuse:false; rayOrigin: mouse" raycaster="objects: .clickable, .ui"></a-entity>
+    </a-entity>
+  </a-scene>
+
+  <script>
+  /* -------------------------
+     Utilities
+     ------------------------- */
+  function mod(n,m){ return ((n % m) + m) % m; }
+  function randInt(n){ return Math.floor(Math.random()*n); }
+  function clamp(v,a,b){ return Math.max(a, Math.min(b, v)); }
+  function shadeColor(hex, delta){
+    const num = parseInt(hex.slice(1),16);
+    let r = (num>>16) + delta;
+    let g = ((num>>8)&0xff) + delta;
+    let b = (num & 0xff) + delta;
+    r = Math.max(0,Math.min(255,r));
+    g = Math.max(0,Math.min(255,g));
+    b = Math.max(0,Math.min(255,b));
+    return '#' + ((r<<16)|(g<<8)|b).toString(16).padStart(6,'0');
+  }
+
+  /* -------------------------
+     Ocean shader (subtle animated color)
+     ------------------------- */
+  AFRAME.registerComponent('ocean-shader', {
+    init: function(){ this.start = performance.now(); },
+    tick: function(t){
+      const elapsed = (t - this.start) / 1000;
+      const g = 0.35 + Math.cos(elapsed * 0.15) * 0.05;
+      const r = 0.0;
+      const b = 0.55 + Math.sin(elapsed * 0.2) * 0.03;
+      const color = `rgb(${Math.floor(r*20)}, ${Math.floor(g*60)}, ${Math.floor(b*255)})`;
+      this.el.setAttribute('material', 'color', color);
+      this.el.object3D.rotation.y = elapsed * 0.01;
+    }
+  });
+
+  /* -------------------------
+     Bumpy sphere (noise displacement)
+     ------------------------- */
+  AFRAME.registerComponent('bumpy-sphere', {
+    schema: { amplitude: { type: 'number', default: 0.12 }, speed: { type: 'number', default: 0.6 } },
+    init: function(){
+      this.mesh = this.el.getObject3D('mesh');
+      if (!this.mesh) {
+        this.el.addEventListener('object3dset', () => { this.mesh = this.el.getObject3D('mesh'); this.setup(); });
+      } else this.setup();
+    },
+    setup: function(){
+      this.geometry = this.mesh.geometry;
+      this.basePos = new Float32Array(this.geometry.attributes.position.array);
+      this.simplex = new SimplexNoise(Math.random());
+      this.vertexCount = this.geometry.attributes.position.count;
+      this.noiseSeed = new Float32Array(this.vertexCount);
+      for (let i=0;i<this.vertexCount;i++) this.noiseSeed[i] = Math.random() * 10;
+      this.start = performance.now();
+    },
+    tick: function(time){
+      if (!this.geometry || !this.basePos) return;
+      const pos = this.geometry.attributes.position.array;
+      const amp = this.data.amplitude;
+      const speed = this.data.speed;
+      const t = (time - this.start) / 1000;
+      for (let i=0;i<this.vertexCount;i++){
+        const bx = this.basePos[i*3], by = this.basePos[i*3+1], bz = this.basePos[i*3+2];
+        const n = this.simplex.noise3D(bx*0.5 + this.noiseSeed[i], by*0.5, t*0.2*speed);
+        const factor = 1 + n * amp * 0.6;
+        pos[i*3] = bx * factor;
+        pos[i*3+1] = by * factor;
+        pos[i*3+2] = bz * factor;
+      }
+      this.geometry.attributes.position.needsUpdate = true;
+      this.geometry.computeVertexNormals();
+    }
+  });
+
+  /* -------------------------
+     Improved orbit-camera (full implementation)
+     - Starts focused on UI, transitions to planet on start, back to UI on stop/end.
+     ------------------------- */
+  AFRAME.registerComponent('orbit-camera', {
+    schema: {
+      uiDistance: { type: 'number', default: 3.2 },
+      planetDistance: { type: 'number', default: 8.0 },
+      sensitivity: { type: 'number', default: 0.9 },
+      smoothTime: { type: 'number', default: 300 }
+    },
+    init: function(){
+      this.theta = THREE.Math.degToRad(20);
+      this.phi = THREE.Math.degToRad(60);
+      this.distance = this.data.uiDistance;
+      this.dragging = false;
+      this.last = {x:0,y:0};
+      this.focus = 'ui';
+      this.transition = null;
+      // targets (match UI placement and planet center)
+      this.uiTarget = new THREE.Vector3(-1.6, 1.6, -3);
+      this.planetTarget = new THREE.Vector3(0,0,0);
+      // set immediate to UI
+      this.setImmediateToFocus('ui');
+      // attach mouse handlers
+      const attach = () => {
+        const c = this.el.sceneEl.canvas;
+        if (!c) { setTimeout(attach,50); return; }
+        c.addEventListener('mousedown', this._onMouseDown = (e)=>{ this.dragging = true; this.last.x = e.clientX; this.last.y = e.clientY; });
+        window.addEventListener('mouseup', this._onMouseUp = ()=>{ this.dragging = false; });
+        window.addEventListener('mousemove', this._onMouseMove = (e)=>{ if (!this.dragging) return; const dx = e.clientX - this.last.x; const dy = e.clientY - this.last.y; this.last.x = e.clientX; this.last.y = e.clientY; this.theta -= dx * 0.005 * this.data.sensitivity; this.phi = clamp(this.phi - dy * 0.005 * this.data.sensitivity, 0.05, Math.PI - 0.05); });
+        c.addEventListener('wheel', this._onWheel = (e)=>{ this.distance = clamp(this.distance + e.deltaY * 0.01, 3.0, 18.0); }, {passive:true});
+      };
+      attach();
+    },
+    remove: function(){
+      const c = this.el.sceneEl && this.el.sceneEl.canvas;
+      if (c && this._onMouseDown) c.removeEventListener('mousedown', this._onMouseDown);
+      if (this._onMouseMove) window.removeEventListener('mousemove', this._onMouseMove);
+      if (this._onMouseUp) window.removeEventListener('mouseup', this._onMouseUp);
+      if (c && this._onWheel) c.removeEventListener('wheel', this._onWheel);
+    },
+    setImmediateToFocus: function(which){
+      this.focus = which;
+      if (which === 'ui'){
+        this.distance = this.data.uiDistance;
+        this.theta = THREE.Math.degToRad(20);
+        this.phi = THREE.Math.degToRad(60);
+        this.applyPositionToRig(this.uiTarget, this.distance);
+      } else {
+        this.distance = this.data.planetDistance;
+        this.theta = 0;
+        this.phi = Math.PI/6;
+        this.applyPositionToRig(this.planetTarget, this.distance);
+      }
+    },
+    focusOn: function(which){
+      if (which !== 'ui' && which !== 'planet') return;
+      if (this.focus === which && !this.transition) return;
+      const now = performance.now();
+      const duration = this.data.smoothTime;
+      const fromPos = this.el.object3D.position.clone();
+      const target = (which === 'ui') ? this.uiTarget : this.planetTarget;
+      const targetDistance = (which === 'ui') ? this.data.uiDistance : this.data.planetDistance;
+      const desired = this.computeRigPositionFor(target, this.theta, this.phi, targetDistance);
+      this.transition = { startTime: now, duration, fromPos, toPos: desired, toDistance: targetDistance, toFocus: which };
+      this.focus = which;
+    },
+    computeRigPositionFor: function(targetVec3, theta, phi, distance){
+      const x = targetVec3.x + distance * Math.sin(phi) * Math.cos(theta);
+      const z = targetVec3.z + distance * Math.sin(phi) * Math.sin(theta);
+      const y = targetVec3.y + distance * Math.cos(phi);
+      return new THREE.Vector3(x,y,z);
+    },
+    applyPositionToRig: function(targetVec3, distance){
+      const pos = this.computeRigPositionFor(targetVec3, this.theta, this.phi, distance);
+      this.el.setAttribute('position', { x: pos.x, y: pos.y, z: pos.z });
+      const cam = this.el.querySelector('[camera]');
+      if (cam) cam.object3D.lookAt(targetVec3.x, targetVec3.y, targetVec3.z);
+    },
+    tick: function(){
+      if (this.transition){
+        const now = performance.now();
+        const t = clamp((now - this.transition.startTime) / this.transition.duration, 0, 1);
+        const ease = t * t * (3 - 2 * t);
+        const curPos = new THREE.Vector3().lerpVectors(this.transition.fromPos, this.transition.toPos, ease);
+        this.el.setAttribute('position', { x: curPos.x, y: curPos.y, z: curPos.z });
+        this.distance = THREE.Math.lerp(this.distance, this.transition.toDistance, ease);
+        const targetVec = (this.transition.toFocus === 'ui') ? this.uiTarget : this.planetTarget;
+        const cam = this.el.querySelector('[camera]');
+        if (cam) cam.object3D.lookAt(targetVec.x, targetVec.y, targetVec.z);
+        if (t >= 1) { this.transition = null; this.applyPositionToRig(targetVec, this.distance); }
+        return;
+      }
+      const targetVec = (this.focus === 'ui') ? this.uiTarget : this.planetTarget;
+      const pos = this.computeRigPositionFor(targetVec, this.theta, this.phi, this.distance);
+      this.el.setAttribute('position', { x: pos.x, y: pos.y, z: pos.z });
+      const cam = this.el.querySelector('[camera]');
+      if (cam) cam.object3D.lookAt(targetVec.x, targetVec.y, targetVec.z);
+    }
+  });
+
+  /* -------------------------
+     UI components (slider & select)
+     Minimal, interactive via click events.
+     ------------------------- */
+  AFRAME.registerComponent('ui-slider', {
+    schema: { min: {type:'number', default:1}, max:{type:'number', default:10}, value:{type:'number', default:5} },
+    init: function(){
+      const el = this.el, data = this.data;
+      const left = document.createElement('a-box'); left.setAttribute('width',0.12); left.setAttribute('height',0.12); left.setAttribute('depth',0.04); left.setAttribute('color','#222'); left.classList.add('clickable','ui'); left.setAttribute('position','-0.36 0 0'); el.appendChild(left);
+      const right = document.createElement('a-box'); right.setAttribute('width',0.12); right.setAttribute('height',0.12); right.setAttribute('depth',0.04); right.setAttribute('color','#222'); right.classList.add('clickable','ui'); right.setAttribute('position','0.36 0 0'); el.appendChild(right);
+      const bar = document.createElement('a-plane'); bar.setAttribute('width',0.6); bar.setAttribute('height',0.08); bar.setAttribute('color','#111'); bar.setAttribute('position','0 0 0.01'); el.appendChild(bar);
+      const knob = document.createElement('a-box'); knob.setAttribute('width',0.08); knob.setAttribute('height',0.12); knob.setAttribute('depth',0.06); knob.setAttribute('color','#9fd'); knob.setAttribute('position','0 0 0.03'); el.appendChild(knob);
+      const label = document.createElement('a-text'); label.setAttribute('value', data.value.toString()); label.setAttribute('color','#cfe'); label.setAttribute('align','center'); label.setAttribute('position','0 -0.18 0.02'); label.setAttribute('width',0.8); el.appendChild(label);
+      this.knob = knob; this.label = label;
+      this.updateKnob();
+      left.addEventListener('click', ()=>{ this.setValue(this.data.value - 1); });
+      right.addEventListener('click', ()=>{ this.setValue(this.data.value + 1); });
+      el.setValue = (v)=> this.setValue(v);
+    },
+    setValue: function(v){
+      v = Math.round(clamp(v, this.data.min, this.data.max));
+      this.data.value = v;
+      this.updateKnob();
+      this.el.emit('change', { value: v });
+    },
+    updateKnob: function(){
+      const t = (this.data.value - this.data.min) / (this.data.max - this.data.min);
+      const x = (t - 0.5) * 0.6;
+      this.knob.setAttribute('position', `${x} 0 0.03`);
+      this.label.setAttribute('value', this.data.value.toString());
+    }
+  });
+
+  AFRAME.registerComponent('ui-select', {
+    schema: { options: {type:'string', default:'0,1,2,3'}, labels:{type:'string', default:''}, value:{type:'string', default:''} },
+    init: function(){
+      const el = this.el;
+      this.opts = this.data.options.split(',');
+      this.labels = this.data.labels ? this.data.labels.split(',') : [];
+      this.index = this.opts.indexOf(this.data.value.toString()); if (this.index < 0) this.index = 0;
+      const left = document.createElement('a-box'); left.setAttribute('width',0.12); left.setAttribute('height',0.12); left.setAttribute('depth',0.04); left.setAttribute('color','#222'); left.classList.add('clickable','ui'); left.setAttribute('position','-0.36 0 0'); el.appendChild(left);
+      const right = document.createElement('a-box'); right.setAttribute('width',0.12); right.setAttribute('height',0.12); right.setAttribute('depth',0.04); right.setAttribute('color','#222'); right.classList.add('clickable','ui'); right.setAttribute('position','0.36 0 0'); el.appendChild(right);
+      const label = document.createElement('a-text'); label.setAttribute('value', this.labels[this.index] || this.opts[this.index]); label.setAttribute('color','#cfe'); label.setAttribute('align','center'); label.setAttribute('position','0 0 0.02'); label.setAttribute('width',0.9); el.appendChild(label);
+      this.label = label;
+      left.addEventListener('click', ()=>{ this.index = (this.index - 1 + this.opts.length) % this.opts.length; this.update(); });
+      right.addEventListener('click', ()=>{ this.index = (this.index + 1) % this.opts.length; this.update(); });
+      this.update();
+    },
+    update: function(){ const val = this.opts[this.index]; this.el.emit('change', { value: val }); this.label.setAttribute('value', this.labels[this.index] || val); },
+    getValue: function(){ return this.opts[this.index]; }
+  });
+
+  /* -------------------------
+     Game manager (complete)
+     - Implements spherical grid movement, enemy AI, UI integration, camera focus switching.
+     ------------------------- */
+  AFRAME.registerComponent('game-manager', {
+    init: function(){
+      // config
+      this.STANDARD_COLS = 24; this.STANDARD_ROWS = 16;
+      this.SPHERE_RADIUS = 3.0; this.SEGMENT_SIZE = 0.18; this.SURFACE_OFFSET = 0.12;
+      this.COLORS = { player1Head:'#9aff9a', player1Body:'#2ecc40', player2Head:'#ffd86b', player2Body:'#ffcc00', food:'#ff4444', enemyColors:['#66ccff','#ff66cc','#ffcc66'], enemyGray:'#888888' };
+      // state
+      this.players = []; this.enemies = []; this.food = null; this.running = false;
+      this.moveInterval = 200; this.moveTimer = 0; this.lastTime = null;
+      this.aggroActive = false; this.aggroTimer = 0; this.aggroTriggerPlayerId = null; this.aggroPlayerEatsAtStart = 0;
+      // refs
+      this.landEl = document.getElementById('land'); this.actorsEl = document.getElementById('actors');
+      this.uiRoot = document.getElementById('uiRoot'); this.speedSlider = document.getElementById('speedSlider');
+      this.enemySelector = document.getElementById('enemySelector'); this.modeSelector = document.getElementById('modeSelector');
+      this.startBtn = document.getElementById('startBtn'); this.stopBtn = document.getElementById('stopBtn'); this.scoreText = document.getElementById('scoreText');
+      this.cameraRig = document.getElementById('cameraRig');
+      // grid default
+      this.GRID_COLS = this.STANDARD_COLS; this.GRID_ROWS = this.STANDARD_ROWS;
+      // bind UI
+      this.bindUI();
+      // keyboard
+      window.addEventListener('keydown', (e)=> this.onKeyDown(e));
+      // start tick after scene loaded
+      this.el.sceneEl.addEventListener('loaded', ()=>{ this.lastTime = performance.now(); this.tick(); });
+    },
+
+    bindUI: function(){
+      // slider change -> update interval
+      this.speedSlider.addEventListener('change', (evt)=>{ const v = evt.detail.value; this.moveInterval = this.speedToInterval(v); });
+      // start/stop
+      this.startBtn.addEventListener('click', ()=> this.startGame());
+      this.stopBtn.addEventListener('click', ()=> this.stopGame());
+    },
+
+    speedToInterval: function(speed){ return 350 - (speed - 1) * 30; },
+
+    onKeyDown: function(e){
+      if (!this.running) return;
+      const key = e.key.toLowerCase();
+      const p1 = this.players[0];
+      if (p1 && p1.alive){ if (key==='w') this.trySetNextDir(p1,{x:0,y:-1}); if (key==='s') this.trySetNextDir(p1,{x:0,y:1}); if (key==='a') this.trySetNextDir(p1,{x:-1,y:0}); if (key==='d') this.trySetNextDir(p1,{x:1,y:0}); }
+      const p2 = this.players[1];
+      if (p2 && p2.alive){ if (key==='arrowup') this.trySetNextDir(p2,{x:0,y:-1}); if (key==='arrowdown') this.trySetNextDir(p2,{x:0,y:1}); if (key==='arrowleft') this.trySetNextDir(p2,{x:-1,y:0}); if (key==='arrowright') this.trySetNextDir(p2,{x:1,y:0}); }
+    },
+
+    trySetNextDir: function(actor, dir){ if (!actor) return; if (this.isOpposite(dir, actor.dir)) return; actor.nextDir = dir; },
+    isOpposite: function(a,b){ return a.x === -b.x && a.y === -b.y; },
+
+    startGame: function(){
+      // lock UI visuals
+      this.startBtn.setAttribute('color','#333'); this.stopBtn.setAttribute('color','#111');
+      // configure grid size based on enemy selector
+      const enemyCount = parseInt(this.enemySelector.components['ui-select'].opts[this.enemySelector.components['ui-select'].index]);
+      if (enemyCount <= 1){ this.GRID_COLS = this.STANDARD_COLS; this.GRID_ROWS = this.STANDARD_ROWS; } else { this.GRID_COLS = this.STANDARD_COLS * 2; this.GRID_ROWS = this.STANDARD_ROWS * 2; }
+      // set interval from slider
+      const speedVal = this.speedSlider.components['ui-slider'].data.value;
+      this.moveInterval = this.speedToInterval(speedVal);
+      // reset and spawn
+      this.resetState(); this.spawnActors();
+      this.running = true;
+      // randomize bumpiness
+      const amp = 0.06 + Math.random()*0.14; const spd = 0.3 + Math.random()*1.0;
+      this.landEl.setAttribute('bumpy-sphere', { amplitude: amp, speed: spd });
+      // focus camera on planet smoothly
+      if (this.cameraRig && this.cameraRig.components && this.cameraRig.components['orbit-camera']) this.cameraRig.components['orbit-camera'].focusOn('planet');
+    },
+
+    stopGame: function(){
+      this.running = false;
+      this.startBtn.setAttribute('color','#111'); this.stopBtn.setAttribute('color','#333');
+      if (this.cameraRig && this.cameraRig.components && this.cameraRig.components['orbit-camera']) this.cameraRig.components['orbit-camera'].focusOn('ui');
+      this.showMessage('Paused');
+    },
+
+    resetState: function(){
+      while (this.actorsEl.firstChild) this.actorsEl.removeChild(this.actorsEl.firstChild);
+      this.players = []; this.enemies = []; this.food = null;
+      this.aggroActive = false; this.aggroTimer = 0; this.aggroTriggerPlayerId = null; this.aggroPlayerEatsAtStart = 0;
+      this.updateScoreUI();
+    },
+
+    spawnActors: function(){
+      const midC = Math.floor(this.GRID_COLS/2), midR = Math.floor(this.GRID_ROWS/2);
+      this.players.push(this.createPlayer(1, midC, midR, {x:1,y:0}, this.COLORS.player1Head, this.COLORS.player1Body));
+      const mode = parseInt(this.modeSelector.components['ui-select'].opts[this.modeSelector.components['ui-select'].index]);
+      if (mode === 2) this.players.push(this.createPlayer(2, midC, midR + 3, {x:1,y:0}, this.COLORS.player2Head, this.COLORS.player2Body));
+      const enemyCount = parseInt(this.enemySelector.components['ui-select'].opts[this.enemySelector.components['ui-select'].index]);
+      for (let i=0;i<enemyCount;i++){
+        const spawn = this.findSpawnForLength(3);
+        if (spawn) this.enemies.push(this.createEnemy(i+1, spawn.col, spawn.row, spawn.dir, this.COLORS.enemyColors[i % this.COLORS.enemyColors.length]));
+        else {
+          for (let attempts=0; attempts<1000; attempts++){
+            const c = randInt(this.GRID_COLS), r = randInt(this.GRID_ROWS);
+            if (!this.isCellOccupied(c,r)){ this.enemies.push(this.createEnemy(i+1, c, r, {x:-1,y:0}, this.COLORS.enemyColors[i % this.COLORS.enemyColors.length])); break; }
+          }
+        }
+      }
+      for (const p of this.players) this.createSegmentEntitiesFor(p);
+      for (const e of this.enemies) this.createSegmentEntitiesFor(e);
+      this.placeFoodRandom(); this.updateAllSegmentPositions(); this.updateScoreUI();
+    },
+
+    createPlayer: function(id,col,row,dir,headColor,bodyColor){ return { id, type:'player', snake:[{col,row},{col:mod(col-1,this.GRID_COLS),row},{col:mod(col-2,this.GRID_COLS),row}], dir, nextDir:{...dir}, colorHead:headColor, colorBody:bodyColor, alive:true, eats:0, consecutiveEats:0, segmentEls:[] }; },
+    createEnemy: function(id,col,row,dir,color){ return { id, type:'enemy', snake:[{col,row},{col:mod(col-1,this.GRID_COLS),row},{col:mod(col-2,this.GRID_COLS),row}], dir, nextDir:{...dir}, colorHead:color, colorBody:shadeColor(color,-20), alive:true, eats:0, consecutiveEats:0, aggro:false, segmentEls:[] }; },
+
+    createSegmentEntitiesFor: function(actor){
+      actor.segmentEls = [];
+      for (let i=0;i<actor.snake.length;i++){
+        const color = (i===0) ? actor.colorHead : actor.colorBody;
+        const el = document.createElement('a-box');
+        el.setAttribute('width', this.SEGMENT_SIZE); el.setAttribute('height', this.SEGMENT_SIZE); el.setAttribute('depth', this.SEGMENT_SIZE);
+        el.setAttribute('material', `color: ${color}; metalness:0.2; roughness:0.6`);
+        this.actorsEl.appendChild(el); actor.segmentEls.push(el);
+      }
+    },
+
+    gridToSpherical: function(col,row){ const theta = (col / this.GRID_COLS) * Math.PI * 2; const phi = (row / this.GRID_ROWS) * Math.PI; return { theta, phi }; },
+    spherical
