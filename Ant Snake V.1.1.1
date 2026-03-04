@@ -1,0 +1,678 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>ANT Snake Game</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    /* Minimal retro styling */
+    body {
+      background: #0b0b0b;
+      color: #cfe;
+      font-family: "Courier New", monospace;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+      margin: 0;
+    }
+    .container {
+      display: grid;
+      grid-template-columns: auto 260px;
+      gap: 16px;
+      align-items: start;
+    }
+    canvas {
+      background: #000;
+      image-rendering: pixelated;
+      border: 4px solid #222;
+      display: block;
+    }
+    .panel {
+      background: #071017;
+      padding: 12px;
+      border: 2px solid #222;
+      color: #9fd;
+      min-width: 240px;
+    }
+    /* Title styling: green letters for the game name */
+    .title {
+      color: #9aff9a; /* bright retro green */
+      font-weight: bold;
+      font-size: 20px;
+      margin-bottom: 8px;
+      letter-spacing: 1px;
+    }
+    label, .score { display:block; margin-bottom:8px; }
+    input[type="range"], select { width:100%; }
+    button {
+      background: #111;
+      color: #9fd;
+      border: 1px solid #333;
+      padding: 8px 12px;
+      cursor: pointer;
+      font-family: inherit;
+    }
+    button:disabled { opacity: 0.5; cursor: default; }
+    .small { font-size:12px; color:#9aa; }
+    .overlay {
+      position:absolute; left:0; top:0; width:100%; height:100%;
+      display:flex; align-items:center; justify-content:center;
+      color:#fff; font-size:20px; pointer-events:none;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div style="position:relative;">
+      <canvas id="game" width="512" height="512"></canvas>
+      <div id="overlay" class="overlay" style="display:none;"></div>
+    </div>
+
+    <div class="panel">
+      <!-- Game name in green letters as requested -->
+      <div class="title">ANT Snake Game</div>
+
+      <label><strong>Speed</strong></label>
+      <input id="speed" type="range" min="1" max="10" value="5" />
+      <div class="small">1 = slowest, 10 = fastest (applies to player & enemies)</div>
+
+      <label style="margin-top:10px;"><strong>Enemies</strong></label>
+      <select id="enemyCount">
+        <option value="1">1 enemy</option>
+        <option value="2">2 enemies</option>
+        <option value="3">3 enemies</option>
+      </select>
+      <div class="small">Choose before starting. Map size scales for 2–3 enemies.</div>
+
+      <div style="margin-top:12px;">
+        <button id="startBtn">Start</button>
+        <button id="stopBtn" disabled>Stop</button>
+      </div>
+
+      <div style="margin-top:12px;">
+        <div class="score"><strong>Score:</strong> <span id="score">0</span></div>
+        <div class="small">Controls: <strong>W</strong> Up, <strong>A</strong> Left, <strong>S</strong> Down, <strong>D</strong> Right</div>
+        <div class="small" style="margin-top:6px;">Win when your snake covers <strong>65%</strong> of the field.</div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    /************************************************************************
+     * Retro Snake with Enemies and Aggressive Mode
+     *
+     * Structure:
+     *  - Configuration & UI
+     *  - Game logic (state, movement, collisions, win)
+     *  - AI behavior (enemy decision making & movement)
+     *  - Rendering (draw grid, snakes, food)
+     *  - Input handling (W/A/S/D)
+     *
+     * Player name/title displayed in the interface panel in green letters.
+     ************************************************************************/
+
+    // ----- Configuration & UI -----
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d');
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const speedInput = document.getElementById('speed');
+    const enemyCountSelect = document.getElementById('enemyCount');
+    const scoreEl = document.getElementById('score');
+    const overlay = document.getElementById('overlay');
+
+    // Standard grid size (used for 1 enemy)
+    const STANDARD_COLS = 16;
+    const STANDARD_ROWS = 16;
+
+    // Colors
+    const PLAYER_COLOR_HEAD = '#9aff9a';
+    const PLAYER_COLOR_BODY = '#2ecc40';
+    const ENEMY_COLORS = ['#ffcc66', '#66ccff', '#ff66cc']; // distinct colors for enemies
+    const ENEMY_GRAY = '#888888';
+    const FOOD_COLOR = '#ff4444';
+
+    // Game state
+    let GRID_COLS = STANDARD_COLS;
+    let GRID_ROWS = STANDARD_ROWS;
+    let CELL_SIZE = 0;
+
+    let player = null; // {snake: [{x,y}], dir, nextDir, alive, score, consecutiveEats}
+    let enemies = [];  // array of enemy objects
+    let food = null;   // {x,y}
+    let running = false;
+    let moveInterval = 200; // ms between moves
+    let lastTime = 0;
+    let moveTimer = 0;
+    let settingsLocked = false; // prevent changing speed/enemy count during play
+
+    // Aggressive mode tracking
+    let aggressive = false;
+    let aggressiveTimer = 0;
+    const AGGRESSIVE_DURATION = 10000; // 10 seconds
+    let playerEatsSinceAggroStart = 0;
+
+    // ----- Utility helpers -----
+    function mod(n, m) { return ((n % m) + m) % m; }
+    function randInt(n) { return Math.floor(Math.random() * n); }
+
+    // ----- Initialization -----
+    function configureGrid() {
+      const enemyCount = parseInt(enemyCountSelect.value, 10);
+      if (enemyCount <= 1) {
+        GRID_COLS = STANDARD_COLS;
+        GRID_ROWS = STANDARD_ROWS;
+      } else {
+        // double the field for 2 or 3 enemies
+        GRID_COLS = STANDARD_COLS * 2;
+        GRID_ROWS = STANDARD_ROWS * 2;
+      }
+      // adjust canvas to keep square cells
+      const size = Math.min(640, Math.max(320, GRID_COLS * 16));
+      canvas.width = size;
+      canvas.height = size;
+      CELL_SIZE = canvas.width / GRID_COLS;
+    }
+
+    // Convert speed slider (1..10) to interval ms
+    function speedToInterval(speed) {
+      // speed 1 => 350ms, speed 10 => 70ms
+      return 350 - (speed - 1) * 30;
+    }
+
+    // ----- Game Logic -----
+
+    // Reset game state
+    function resetGameState() {
+      configureGrid();
+      // Player starts centered, short snake
+      const midX = Math.floor(GRID_COLS / 2);
+      const midY = Math.floor(GRID_ROWS / 2);
+      player = {
+        snake: [
+          { x: midX, y: midY },
+          { x: midX - 1, y: midY },
+          { x: midX - 2, y: midY }
+        ],
+        dir: { x: 1, y: 0 },
+        nextDir: { x: 1, y: 0 },
+        alive: true,
+        score: 0,
+        consecutiveEats: 0
+      };
+
+      // Create enemies
+      enemies = [];
+      const enemyCount = parseInt(enemyCountSelect.value, 10);
+      const spawnPositions = generateEnemySpawns(enemyCount);
+      for (let i = 0; i < enemyCount; i++) {
+        const pos = spawnPositions[i];
+        enemies.push({
+          id: i,
+          snake: [
+            { x: pos.x, y: pos.y },
+            { x: pos.x - 1, y: pos.y },
+            { x: pos.x - 2, y: pos.y }
+          ],
+          dir: { x: -1, y: 0 },
+          nextDir: { x: -1, y: 0 },
+          color: ENEMY_COLORS[i % ENEMY_COLORS.length],
+          alive: true,
+          eats: 0, // total eats
+          target: 'food', // 'food' or 'player'
+          aggro: false // whether currently gray/aggressive
+        });
+      }
+
+      // Place initial food(s)
+      placeFood();
+
+      // Reset timers and flags
+      aggressive = false;
+      aggressiveTimer = 0;
+      playerEatsSinceAggroStart = 0;
+      lastTime = 0;
+      moveTimer = 0;
+      scoreEl.textContent = player.score;
+      overlay.style.display = 'none';
+    }
+
+    // Generate spawn positions for enemies (spread out)
+    function generateEnemySpawns(count) {
+      const positions = [];
+      // simple spread: corners or quadrants
+      const marginX = Math.max(2, Math.floor(GRID_COLS / 8));
+      const marginY = Math.max(2, Math.floor(GRID_ROWS / 8));
+      const candidates = [
+        { x: marginX, y: marginY },
+        { x: GRID_COLS - 1 - marginX, y: marginY },
+        { x: marginX, y: GRID_ROWS - 1 - marginY },
+        { x: GRID_COLS - 1 - marginX, y: GRID_ROWS - 1 - marginY },
+        { x: Math.floor(GRID_COLS / 4), y: Math.floor(GRID_ROWS / 2) },
+        { x: Math.floor(3 * GRID_COLS / 4), y: Math.floor(GRID_ROWS / 2) }
+      ];
+      for (let i = 0; i < count; i++) {
+        positions.push(candidates[i % candidates.length]);
+      }
+      return positions;
+    }
+
+    // Place a single food dot at a free cell
+    function placeFood() {
+      // Ensure food not on any snake
+      while (true) {
+        const fx = randInt(GRID_COLS);
+        const fy = randInt(GRID_ROWS);
+        if (isCellFree(fx, fy)) {
+          food = { x: fx, y: fy };
+          return;
+        }
+      }
+    }
+
+    // Check if a cell is free (no player or enemy segment)
+    function isCellFree(x, y) {
+      if (player.snake.some(s => s.x === x && s.y === y)) return false;
+      for (const e of enemies) {
+        if (e.alive && e.snake.some(s => s.x === x && s.y === y)) return false;
+      }
+      return true;
+    }
+
+    // Update one movement step for all actors
+    function updateStep() {
+      if (!player.alive) return;
+
+      // Apply queued directions (no instant reverse)
+      if (!isOpposite(player.nextDir, player.dir)) player.dir = { ...player.nextDir };
+
+      // Update enemies' targets and nextDir via AI
+      for (const e of enemies) {
+        if (!e.alive) continue;
+        updateEnemyTarget(e);
+        // compute nextDir from AI target (set e.nextDir)
+        e.nextDir = computeEnemyNextDir(e);
+        if (!isOpposite(e.nextDir, e.dir)) e.dir = { ...e.nextDir };
+      }
+
+      // Move player
+      const newPlayerHead = {
+        x: mod(player.snake[0].x + player.dir.x, GRID_COLS),
+        y: mod(player.snake[0].y + player.dir.y, GRID_ROWS)
+      };
+
+      // Check collisions: player hitting enemy body or head
+      for (const e of enemies) {
+        if (!e.alive) continue;
+        // If player's new head equals any enemy segment -> player dies
+        if (e.snake.some(seg => seg.x === newPlayerHead.x && seg.y === newPlayerHead.y)) {
+          // Player hit enemy -> player dies
+          player.alive = false;
+          endGame(false);
+          return;
+        }
+      }
+
+      // Add new head
+      player.snake.unshift(newPlayerHead);
+
+      // Check if player ate food
+      if (food && newPlayerHead.x === food.x && newPlayerHead.y === food.y) {
+        player.score += 1;
+        player.consecutiveEats += 1;
+        playerEatsSinceAggroStart += 1;
+        scoreEl.textContent = player.score;
+        // Player grows by 1 (we already unshifted head)
+        placeFood();
+      } else {
+        // normal move: remove tail
+        player.snake.pop();
+        player.consecutiveEats = 0; // reset consecutive if no eat
+      }
+
+      // Move enemies
+      for (const e of enemies) {
+        if (!e.alive) continue;
+        const head = e.snake[0];
+        const newHead = {
+          x: mod(head.x + e.dir.x, GRID_COLS),
+          y: mod(head.y + e.dir.y, GRID_ROWS)
+        };
+
+        // If enemy moves into player head -> enemy dies
+        if (player.snake.some(seg => seg.x === newHead.x && seg.y === newHead.y)) {
+          // Enemy hits player -> enemy dies
+          e.alive = false;
+          // remove enemy body visually by clearing its snake
+          e.snake = [];
+          continue;
+        }
+
+        // If enemy moves into another enemy segment (including itself) -> simple rule: skip move (stay)
+        let collidesEnemy = false;
+        for (const other of enemies) {
+          if (!other.alive) continue;
+          if (other.id === e.id) continue;
+          if (other.snake.some(seg => seg.x === newHead.x && seg.y === newHead.y)) {
+            collidesEnemy = true;
+            break;
+          }
+        }
+        if (collidesEnemy) {
+          // skip movement this tick to avoid complex resolution
+          continue;
+        }
+
+        // If enemy moves into player's body (not head) -> player dies
+        if (player.snake.some((seg, idx) => idx > 0 && seg.x === newHead.x && seg.y === newHead.y)) {
+          player.alive = false;
+          endGame(false);
+          return;
+        }
+
+        // Add enemy head
+        e.snake.unshift(newHead);
+
+        // Check if enemy ate food
+        if (food && newHead.x === food.x && newHead.y === food.y) {
+          // Enemy eats: grows faster than player (gain 2 segments)
+          e.eats += 1;
+          // Duplicate tail to simulate faster growth
+          const tail = e.snake[e.snake.length - 1];
+          e.snake.push({ x: tail.x, y: tail.y });
+          placeFood();
+        } else {
+          // normal enemy move: remove tail
+          e.snake.pop();
+        }
+      }
+
+      // Check win condition: player covers 65% of total field
+      const totalCells = GRID_COLS * GRID_ROWS;
+      if (player.snake.length >= Math.ceil(0.65 * totalCells)) {
+        endGame(true);
+        return;
+      }
+
+      // Aggressive mode handling
+      handleAggressiveMode();
+    }
+
+    // End game: win boolean indicates player won
+    function endGame(win) {
+      running = false;
+      settingsLocked = false;
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+      enemyCountSelect.disabled = false;
+      speedInput.disabled = false;
+      overlay.style.display = 'flex';
+      overlay.textContent = win ? ('You Win! Score: ' + player.score) : ('Game Over — Score: ' + player.score);
+    }
+
+    // Check if two directions are opposites
+    function isOpposite(a, b) {
+      return a.x === -b.x && a.y === -b.y;
+    }
+
+    // ----- AI Behavior -----
+
+    // Update enemy target based on current conditions
+    function updateEnemyTarget(enemy) {
+      // If aggressive mode active, enemies target player
+      if (aggressive) {
+        enemy.target = 'player';
+        enemy.aggro = true;
+        return;
+      }
+
+      // Normal behavior: target food
+      enemy.target = 'food';
+      enemy.aggro = false;
+    }
+
+    // Compute next direction for enemy to move toward its target
+    function computeEnemyNextDir(enemy) {
+      if (!enemy.alive) return { x: 0, y: 0 };
+      const head = enemy.snake[0];
+
+      // Determine target position
+      let tx = food.x, ty = food.y;
+      if (enemy.target === 'player') {
+        tx = player.snake[0].x;
+        ty = player.snake[0].y;
+      }
+
+      // Compute shortest wrap-aware delta
+      let dx = tx - head.x;
+      let dy = ty - head.y;
+
+      // Consider wrapping distances
+      if (Math.abs(dx) > GRID_COLS / 2) {
+        dx = dx > 0 ? dx - GRID_COLS : dx + GRID_COLS;
+      }
+      if (Math.abs(dy) > GRID_ROWS / 2) {
+        dy = dy > 0 ? dy - GRID_ROWS : dy + GRID_ROWS;
+      }
+
+      // Prefer axis with larger absolute distance
+      if (Math.abs(dx) >= Math.abs(dy)) {
+        return { x: Math.sign(dx), y: 0 };
+      } else {
+        return { x: 0, y: Math.sign(dy) };
+      }
+    }
+
+    // Aggressive mode logic
+    function handleAggressiveMode() {
+      // Condition to enter aggressive:
+      // Player eats >5 in a row AND enemies have failed to eat any (total eats == 0)
+      const enemiesHaveEaten = enemies.some(e => e.eats > 0);
+      if (!aggressive && player.consecutiveEats > 5 && !enemiesHaveEaten) {
+        aggressive = true;
+        aggressiveTimer = AGGRESSIVE_DURATION;
+        playerEatsSinceAggroStart = 0;
+        // mark enemies gray
+        for (const e of enemies) e.aggro = true;
+      }
+
+      if (aggressive) {
+        // End condition: timer <= 0 OR player eats 2 more dots since start
+        if (playerEatsSinceAggroStart >= 2 || aggressiveTimer <= 0) {
+          aggressive = false;
+          for (const e of enemies) e.aggro = false;
+        }
+      }
+    }
+
+    // ----- Rendering -----
+
+    function render() {
+      // Clear
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      // Draw subtle grid
+      ctx.strokeStyle = '#0b0b0b';
+      ctx.lineWidth = 1;
+      for (let x = 0; x <= GRID_COLS; x++) {
+        ctx.beginPath();
+        ctx.moveTo(x * CELL_SIZE, 0);
+        ctx.lineTo(x * CELL_SIZE, canvas.height);
+        ctx.stroke();
+      }
+      for (let y = 0; y <= GRID_ROWS; y++) {
+        ctx.beginPath();
+        ctx.moveTo(0, y * CELL_SIZE);
+        ctx.lineTo(canvas.width, y * CELL_SIZE);
+        ctx.stroke();
+      }
+
+      // Draw food
+      if (food) {
+        ctx.fillStyle = FOOD_COLOR;
+        drawCell(food.x, food.y);
+      }
+
+      // Draw enemies
+      for (const e of enemies) {
+        if (!e.alive) continue;
+        const colorHead = e.aggro ? ENEMY_GRAY : e.color;
+        const colorBody = shadeColor(colorHead, -20);
+        for (let i = 0; i < e.snake.length; i++) {
+          const seg = e.snake[i];
+          ctx.fillStyle = (i === 0) ? colorHead : colorBody;
+          drawCell(seg.x, seg.y);
+        }
+      }
+
+      // Draw player
+      if (player && player.alive) {
+        for (let i = 0; i < player.snake.length; i++) {
+          const seg = player.snake[i];
+          ctx.fillStyle = (i === 0) ? PLAYER_COLOR_HEAD : PLAYER_COLOR_BODY;
+          drawCell(seg.x, seg.y);
+        }
+      }
+    }
+
+    function drawCell(gx, gy) {
+      ctx.fillRect(gx * CELL_SIZE + 1, gy * CELL_SIZE + 1, CELL_SIZE - 2, CELL_SIZE - 2);
+    }
+
+    // Utility to slightly shade a hex color (simple)
+    function shadeColor(hex, percent) {
+      // hex like #rrggbb
+      const num = parseInt(hex.slice(1), 16);
+      let r = (num >> 16) + percent;
+      let g = ((num >> 8) & 0x00FF) + percent;
+      let b = (num & 0x0000FF) + percent;
+      r = Math.max(0, Math.min(255, r));
+      g = Math.max(0, Math.min(255, g));
+      b = Math.max(0, Math.min(255, b));
+      return '#' + (r << 16 | g << 8 | b).toString(16).padStart(6, '0');
+    }
+
+    // ----- Input Handling -----
+
+    const KEY_DIR = {
+      'w': { x: 0, y: -1 },
+      'a': { x: -1, y: 0 },
+      's': { x: 0, y: 1 },
+      'd': { x: 1, y: 0 }
+    };
+
+    function onKeyDown(e) {
+      if (!running) return;
+      const k = e.key.toLowerCase();
+      if (k in KEY_DIR) {
+        const desired = KEY_DIR[k];
+        // Prevent reversing direction
+        if (!isOpposite(desired, player.dir)) {
+          player.nextDir = desired;
+          // track player eats during aggressive mode
+          if (aggressive && (player.consecutiveEats > 0)) {
+            playerEatsSinceAggroStart = player.consecutiveEats;
+          }
+        }
+      }
+    }
+
+    // Prevent arrow keys from scrolling
+    window.addEventListener('keydown', (e) => {
+      if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].includes(e.key)) {
+        e.preventDefault();
+      }
+    }, { passive: false });
+
+    window.addEventListener('keydown', onKeyDown);
+
+    // ----- Game Loop -----
+
+    function gameLoop(timestamp) {
+      if (!lastTime) lastTime = timestamp;
+      const delta = timestamp - lastTime;
+      lastTime = timestamp;
+
+      if (running) {
+        moveTimer += delta;
+        // decrement aggressive timer if active
+        if (aggressive) aggressiveTimer -= delta;
+
+        if (moveTimer >= moveInterval) {
+          moveTimer = 0;
+          updateStep();
+        }
+      }
+
+      render();
+      requestAnimationFrame(gameLoop);
+    }
+
+    // ----- Controls: Start / Stop -----
+
+    function startGame() {
+      // Lock settings
+      settingsLocked = true;
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+      enemyCountSelect.disabled = true;
+      speedInput.disabled = true;
+
+      // Configure speed and grid
+      configureGrid();
+      moveInterval = speedToInterval(parseInt(speedInput.value, 10));
+
+      // Reset state
+      resetGameState();
+
+      running = true;
+      lastTime = 0;
+      moveTimer = 0;
+    }
+
+    function stopGame() {
+      running = false;
+      settingsLocked = false;
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+      enemyCountSelect.disabled = false;
+      speedInput.disabled = false;
+      overlay.style.display = 'flex';
+      overlay.textContent = 'Paused';
+    }
+
+    startBtn.addEventListener('click', () => {
+      startGame();
+    });
+    stopBtn.addEventListener('click', () => {
+      stopGame();
+    });
+
+    // Speed and enemy count cannot be changed during gameplay
+    speedInput.addEventListener('input', () => {
+      if (settingsLocked) {
+        // ignore changes while running
+        speedInput.value = speedInput.defaultValue;
+        return;
+      }
+      moveInterval = speedToInterval(parseInt(speedInput.value, 10));
+    });
+
+    enemyCountSelect.addEventListener('change', () => {
+      if (settingsLocked) {
+        enemyCountSelect.value = enemyCountSelect.defaultValue;
+      } else {
+        configureGrid();
+      }
+    });
+
+    // ----- Start render loop (not the game) -----
+    configureGrid();
+    resetGameState();
+    requestAnimationFrame(gameLoop);
+
+  </script>
+</body>
+</html>
