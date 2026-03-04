@@ -1,0 +1,956 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>The ANT Snake</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    :root{
+      --bg:#050607;
+      --panel:#071017;
+      --muted:#9aa;
+      --title-green:#00ff00;
+      --grid-line:#0b0b0b;
+      --food:#ff4444;
+    }
+    html,body{height:100%;margin:0;background:var(--bg);font-family: "Courier New", monospace;color:#cfe;display:flex;align-items:center;justify-content:center;}
+    .layout{display:grid;grid-template-columns:auto 320px;gap:16px;align-items:start;}
+    canvas{background:#000;image-rendering:pixelated;border:4px solid #222;display:block;}
+    .panel{width:320px;background:var(--panel);padding:12px;border:2px solid #222;box-sizing:border-box;text-align:center;}
+    .title{color:var(--title-green);font-size:22px;font-weight:bold;margin-bottom:10px;text-align:center;}
+    label{display:block;text-align:left;margin-top:8px;color:#cfe;}
+    .small{font-size:12px;color:var(--muted);text-align:left;margin-top:6px;}
+    input[type="range"],select{width:100%;margin-top:6px;}
+    .controls{margin-top:10px;}
+    button{background:#111;color:#9fd;border:1px solid #333;padding:8px 12px;cursor:pointer;font-family:inherit;margin:4px;}
+    button:disabled{opacity:0.5;cursor:default;}
+    .score{text-align:left;margin-top:12px;}
+    .overlay{position:absolute;left:0;top:0;width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:#fff;font-size:20px;pointer-events:none;}
+    .legend{font-size:12px;color:var(--muted);text-align:left;margin-top:8px;}
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <div style="position:relative;">
+      <canvas id="game" width="512" height="512"></canvas>
+      <div id="overlay" class="overlay" style="display:none;"></div>
+    </div>
+
+    <div class="panel">
+      <div class="title">The ANT Snake</div>
+
+      <label>Speed</label>
+      <input id="speed" type="range" min="1" max="10" value="5" />
+      <div class="small">1 = slowest, 10 = fastest (applies to players & enemies)</div>
+
+      <label>Enemies</label>
+      <select id="enemyCount">
+        <option value="0">0 enemies</option>
+        <option value="1">1 enemy</option>
+        <option value="2">2 enemies</option>
+        <option value="3">3 enemies</option>
+      </select>
+
+      <label>Mode</label>
+      <select id="mode">
+        <option value="1">1 Player</option>
+        <option value="2">2 Players</option>
+      </select>
+
+      <div class="controls">
+        <button id="startBtn">Start</button>
+        <button id="stopBtn" disabled>Stop</button>
+      </div>
+
+      <div class="score">
+        <strong>Score P1:</strong> <span id="score1">0</span><br/>
+        <strong>Score P2:</strong> <span id="score2">0</span>
+      </div>
+
+      <div class="legend">
+        Controls:<br/>
+        Player 1: <strong>W</strong> Up, <strong>A</strong> Left, <strong>S</strong> Down, <strong>D</strong> Right<br/>
+        Player 2: Arrow keys (only in 2-player mode)<br/>
+        Win when a player's snake covers <strong>65%</strong> of the field.
+      </div>
+    </div>
+  </div>
+
+  <script>
+/*
+  The ANT Snake — Fixes and AI improvement
+  - Fix: enemies disappearing at start (robust spawn that avoids overlaps).
+  - Fix: game ends properly when all snakes are destroyed.
+  - Improvement: smarter enemy AI with 1-2 step lookahead and danger avoidance.
+  - No other mechanics changed.
+*/
+
+/* -------------------------
+   UI & Canvas references
+   ------------------------- */
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const startBtn = document.getElementById('startBtn');
+const stopBtn = document.getElementById('stopBtn');
+const speedInput = document.getElementById('speed');
+const enemyCountSelect = document.getElementById('enemyCount');
+const modeSelect = document.getElementById('mode');
+const overlay = document.getElementById('overlay');
+const score1El = document.getElementById('score1');
+const score2El = document.getElementById('score2');
+
+/* -------------------------
+   Constants & configuration
+   ------------------------- */
+const STANDARD_COLS = 16;
+const STANDARD_ROWS = 16;
+
+const COLORS = {
+  player1Head: '#9aff9a',
+  player1Body: '#2ecc40',
+  player2Head: '#ffd86b',
+  player2Body: '#ffcc00',
+  food: '#ff4444',
+  enemyColors: ['#66ccff', '#ff66cc', '#ffcc66'],
+  enemyGray: '#888888',
+  gridLine: '#0b0b0b'
+};
+
+const AGGRO_THRESHOLD = 5; // >5 consecutive eats triggers
+const AGGRO_DURATION_MS = 10000; // 10 seconds
+const AGGRO_EXTRA_EATS_TO_END = 2; // player eats 2 more dots ends aggro early
+
+/* -------------------------
+   Dynamic game state
+   ------------------------- */
+let GRID_COLS = STANDARD_COLS;
+let GRID_ROWS = STANDARD_ROWS;
+let CELL_SIZE = 32;
+
+let players = [];   // array of player objects (1 or 2)
+let enemies = [];   // array of enemy objects (0-3)
+let food = null;
+
+let running = false;
+let settingsLocked = false;
+let moveInterval = 200; // ms between moves
+let lastTime = 0;
+let moveTimer = 0;
+
+// Aggressive mode state
+let aggroActive = false;
+let aggroTimer = 0;
+let aggroTriggerPlayerId = null;
+let aggroPlayerEatsAtStart = 0;
+
+/* -------------------------
+   Utility helpers
+   ------------------------- */
+function mod(n,m){ return ((n % m) + m) % m; }
+function randInt(n){ return Math.floor(Math.random()*n); }
+function isOpposite(a,b){ return a.x === -b.x && a.y === -b.y; }
+function distManhattan(a,b){
+  const dx = Math.abs(a.x - b.x);
+  const dy = Math.abs(a.y - b.y);
+  // account for wrapping shortest distance
+  const dxWrap = Math.min(dx, GRID_COLS - dx);
+  const dyWrap = Math.min(dy, GRID_ROWS - dy);
+  return dxWrap + dyWrap;
+}
+function shadeColor(hex, delta){
+  const num = parseInt(hex.slice(1),16);
+  let r = (num>>16) + delta;
+  let g = ((num>>8)&0xff) + delta;
+  let b = (num & 0xff) + delta;
+  r = Math.max(0,Math.min(255,r));
+  g = Math.max(0,Math.min(255,g));
+  b = Math.max(0,Math.min(255,b));
+  return '#' + ((r<<16)|(g<<8)|b).toString(16).padStart(6,'0');
+}
+
+/* -------------------------
+   Grid & sizing
+   ------------------------- */
+function configureGrid(){
+  const enemyCount = parseInt(enemyCountSelect.value,10);
+  if (enemyCount <= 1){
+    GRID_COLS = STANDARD_COLS;
+    GRID_ROWS = STANDARD_ROWS;
+  } else {
+    GRID_COLS = STANDARD_COLS * 2;
+    GRID_ROWS = STANDARD_ROWS * 2;
+  }
+  const size = Math.min(720, Math.max(320, GRID_COLS * 24));
+  canvas.width = size;
+  canvas.height = size;
+  CELL_SIZE = canvas.width / GRID_COLS;
+}
+
+/* -------------------------
+   Actor creation
+   ------------------------- */
+function createPlayer(id, startX, startY, dir, headColor, bodyColor){
+  return {
+    id,
+    type: 'player',
+    snake: [{x:startX,y:startY},{x:startX-1,y:startY},{x:startX-2,y:startY}],
+    dir: {...dir},
+    nextDir: {...dir},
+    colorHead: headColor,
+    colorBody: bodyColor,
+    alive: true,
+    eats: 0,
+    consecutiveEats: 0
+  };
+}
+
+function createEnemy(id, startX, startY, dir, color){
+  return {
+    id,
+    type: 'enemy',
+    snake: [{x:startX,y:startY},{x:startX-1,y:startY},{x:startX-2,y:startY}],
+    dir: {...dir},
+    nextDir: {...dir},
+    colorHead: color,
+    colorBody: shadeColor(color, -20),
+    alive: true,
+    eats: 0,
+    consecutiveEats: 0,
+    aggro: false
+  };
+}
+
+/* -------------------------
+   Spawn helpers (robust)
+   ------------------------- */
+/* Find a spawn location for a snake of length `len` such that all segments are free.
+   It searches the grid for a head position and a direction where len consecutive cells are free.
+   Returns {x,y,dir} or null if none found. */
+function findSpawnForLength(len){
+  // directions to try (prefer horizontal and vertical)
+  const dirs = [{x:1,y:0},{x:-1,y:0},{x:0,y:1},{x:0,y:-1}];
+  for (let x=0;x<GRID_COLS;x++){
+    for (let y=0;y<GRID_ROWS;y++){
+      for (const d of dirs){
+        let ok = true;
+        let cells = [];
+        let cx = x, cy = y;
+        for (let i=0;i<len;i++){
+          if (!isCellFree(cx,cy)) { ok = false; break; }
+          cells.push({x:cx,y:cy});
+          cx = mod(cx - d.x, GRID_COLS); // place body trailing behind head
+          cy = mod(cy - d.y, GRID_ROWS);
+        }
+        if (ok) return {x,y,dir:d};
+      }
+    }
+  }
+  return null;
+}
+
+function generateEnemySpawns(count){
+  // Use robust spawn finder to avoid overlaps with players
+  const spawns = [];
+  for (let i=0;i<count;i++){
+    const s = findSpawnForLength(3);
+    if (s) {
+      // mark those cells as occupied by temporarily adding to a set
+      // but we will actually create enemies later
+      spawns.push(s);
+      // temporarily occupy cells to avoid overlapping subsequent spawns
+      occupyTemporary(s);
+    } else {
+      // fallback: random free cell for head
+      let attempts = 0;
+      while (attempts < 1000){
+        const fx = randInt(GRID_COLS);
+        const fy = randInt(GRID_ROWS);
+        if (isCellFree(fx,fy)){
+          spawns.push({x:fx,y:fy,dir:{x:-1,y:0}});
+          occupyTemporary({x:fx,y:fy,dir:{x:-1,y:0}});
+          break;
+        }
+        attempts++;
+      }
+    }
+  }
+  // clear temporary occupancy markers
+  clearTemporaryOccupancy();
+  return spawns;
+}
+
+/* Temporary occupancy to avoid overlapping spawns during generation */
+let _tempOccupied = new Set();
+function occupyTemporary(spawn){
+  let cx = spawn.x, cy = spawn.y;
+  for (let i=0;i<3;i++){
+    _tempOccupied.add(cx + ',' + cy);
+    cx = mod(cx - spawn.dir.x, GRID_COLS);
+    cy = mod(cy - spawn.dir.y, GRID_ROWS);
+  }
+}
+function clearTemporaryOccupancy(){ _tempOccupied.clear(); }
+function isCellFree(x,y){
+  // consider temporary occupancy during spawn generation
+  if (_tempOccupied.has(x + ',' + y)) return false;
+  for (const p of players) if (p.alive && p.snake.some(s => s.x === x && s.y === y)) return false;
+  for (const e of enemies) if (e.alive && e.snake.some(s => s.x === x && s.y === y)) return false;
+  return true;
+}
+
+/* -------------------------
+   Reset / initialize game
+   ------------------------- */
+function resetGameState(){
+  configureGrid();
+  players = [];
+  enemies = [];
+  food = null;
+  aggroActive = false;
+  aggroTimer = 0;
+  aggroTriggerPlayerId = null;
+  aggroPlayerEatsAtStart = 0;
+
+  const mode = parseInt(modeSelect.value,10);
+  const enemyCount = parseInt(enemyCountSelect.value,10);
+
+  // Players
+  const midX = Math.floor(GRID_COLS/2);
+  const midY = Math.floor(GRID_ROWS/2);
+  players.push(createPlayer(1, midX, midY, {x:1,y:0}, COLORS.player1Head, COLORS.player1Body));
+  if (mode === 2){
+    players.push(createPlayer(2, midX, midY + 3, {x:1,y:0}, COLORS.player2Head, COLORS.player2Body));
+  }
+
+  // Enemies: robust spawn using findSpawnForLength to avoid overlaps
+  const spawns = generateEnemySpawns(enemyCount);
+  for (let i=0;i<spawns.length;i++){
+    const s = spawns[i];
+    // ensure final spawn cells are free (players already placed)
+    let sx = s.x, sy = s.y, dir = s.dir;
+    // if any of the 3 cells are occupied (rare), try to find another spawn
+    let conflict = false;
+    let cx = sx, cy = sy;
+    for (let k=0;k<3;k++){
+      if (!isCellFree(cx,cy)) { conflict = true; break; }
+      cx = mod(cx - dir.x, GRID_COLS);
+      cy = mod(cy - dir.y, GRID_ROWS);
+    }
+    if (conflict){
+      const alt = findSpawnForLength(3);
+      if (alt){ sx = alt.x; sy = alt.y; dir = alt.dir; }
+      // else keep original and hope for best
+    }
+    enemies.push(createEnemy(i+1, sx, sy, dir, COLORS.enemyColors[i % COLORS.enemyColors.length]));
+  }
+
+  // Extra safety: if enemyCount > 0 but enemies array is empty for any reason, spawn them in free cells
+  if (enemyCount > 0 && enemies.length === 0){
+    for (let i=0;i<enemyCount;i++){
+      const alt = findSpawnForLength(3);
+      if (alt){
+        enemies.push(createEnemy(i+1, alt.x, alt.y, alt.dir, COLORS.enemyColors[i % COLORS.enemyColors.length]));
+      } else {
+        // fallback: find any free cell for head and place minimal snake
+        for (let x=0;x<GRID_COLS;x++){
+          let placed = false;
+          for (let y=0;y<GRID_ROWS;y++){
+            if (isCellFree(x,y)){
+              enemies.push(createEnemy(i+1, x, y, {x:-1,y:0}, COLORS.enemyColors[i % COLORS.enemyColors.length]));
+              placed = true; break;
+            }
+          }
+          if (placed) break;
+        }
+      }
+    }
+  }
+
+  placeFood();
+  updateScoreUI();
+  overlay.style.display = 'none';
+}
+
+/* -------------------------
+   Food placement
+   ------------------------- */
+function placeFood(){
+  // Place food at a free cell
+  while (true){
+    const fx = randInt(GRID_COLS);
+    const fy = randInt(GRID_ROWS);
+    if (isCellFree(fx,fy)){
+      food = {x:fx,y:fy};
+      return;
+    }
+  }
+}
+
+/* -------------------------
+   Input handling
+   ------------------------- */
+const KEY_TO_DIR_P1 = {
+  'w': {x:0,y:-1},
+  'a': {x:-1,y:0},
+  's': {x:0,y:1},
+  'd': {x:1,y:0}
+};
+const KEY_TO_DIR_P2 = {
+  'arrowup': {x:0,y:-1},
+  'arrowleft': {x:-1,y:0},
+  'arrowdown': {x:0,y:1},
+  'arrowright': {x:1,y:0}
+};
+
+window.addEventListener('keydown', (e) => {
+  if (!running) return;
+  const key = e.key.toLowerCase();
+
+  // Player 1
+  if (key in KEY_TO_DIR_P1){
+    const dir = KEY_TO_DIR_P1[key];
+    const p1 = players[0];
+    if (p1 && p1.alive && !isOpposite(dir, p1.dir)) p1.nextDir = dir;
+  }
+
+  // Player 2
+  if (key in KEY_TO_DIR_P2){
+    const p2 = players[1];
+    if (p2 && p2.alive){
+      const dir = KEY_TO_DIR_P2[key];
+      if (!isOpposite(dir, p2.dir)) p2.nextDir = dir;
+    }
+  }
+
+  if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].includes(e.key)) e.preventDefault();
+}, {passive:false});
+
+/* -------------------------
+   Enemy AI (smarter)
+   - For each possible move (no reverse), evaluate safety using 1-2 step lookahead.
+   - Avoid moves that lead to predicted collisions (occupied tiles or head-head).
+   - Score moves by safety and distance to food; choose best.
+   ------------------------- */
+
+const POSSIBLE_DIRS = [{x:1,y:0},{x:-1,y:0},{x:0,y:1},{x:0,y:-1}];
+
+// Predict positions of all actors for `steps` steps assuming they continue current direction.
+// Returns an array of sets: predictedOccupied[step] = Set of "x,y" positions occupied at that step (after movement).
+function predictOccupiedSets(steps){
+  const actors = [...players, ...enemies].filter(a => a.alive);
+  // clone current snakes and dirs
+  const clones = actors.map(a => ({
+    actor: a,
+    snake: a.snake.map(s => ({x:s.x,y:s.y})),
+    dir: {x: a.dir.x, y: a.dir.y}
+  }));
+  const predicted = [];
+  for (let step=1; step<=steps; step++){
+    const occ = new Set();
+    // compute next head for each clone
+    const nextHeads = clones.map(c => {
+      const head = c.snake[0];
+      return { x: mod(head.x + c.dir.x, GRID_COLS), y: mod(head.y + c.dir.y, GRID_ROWS) };
+    });
+    // add next heads and bodies after movement
+    for (let i=0;i<clones.length;i++){
+      const c = clones[i];
+      const nh = nextHeads[i];
+      // add head
+      occ.add(nh.x + ',' + nh.y);
+      // simulate body shift: new snake would have nh at front and pop tail
+      const newSnake = [nh, ...c.snake.slice(0, c.snake.length - 1)];
+      // add body positions
+      for (const seg of newSnake) occ.add(seg.x + ',' + seg.y);
+      // update clone snake for next iteration
+      c.snake = newSnake;
+    }
+    predicted.push(occ);
+  }
+  return predicted;
+}
+
+// Evaluate candidate direction for enemy with lookahead and scoring
+function chooseEnemyDirection(enemy){
+  if (!enemy.alive) return enemy.dir;
+  const head = enemy.snake[0];
+  const currentDir = enemy.dir;
+  const candidates = [];
+  for (const d of POSSIBLE_DIRS){
+    if (isOpposite(d, currentDir)) continue; // no instant reverse
+    candidates.push(d);
+  }
+
+  // Predict occupied tiles for 2 steps by other actors (excluding this enemy's own planned moves)
+  const predicted = predictOccupiedSets(2);
+
+  let best = null;
+  let bestScore = -Infinity;
+
+  for (const cand of candidates){
+    // simulate enemy's next positions for 1-2 steps following cand (wrap-aware)
+    const pos1 = { x: mod(head.x + cand.x, GRID_COLS), y: mod(head.y + cand.y, GRID_ROWS) };
+    const pos2 = { x: mod(pos1.x + cand.x, GRID_COLS), y: mod(pos1.y + cand.y, GRID_ROWS) };
+
+    // Danger checks:
+    // - If pos1 is in predicted[0] (likely occupied next tick) -> high danger
+    // - If pos2 is in predicted[1] -> danger
+    // - If pos1 equals any current other snake segment -> immediate death (we handle earlier but avoid)
+    // - If pos1 equals another actor's predicted head (head-head) -> danger
+    let dangerScore = 0;
+
+    // predicted[0] and predicted[1] are sets of "x,y"
+    const key1 = pos1.x + ',' + pos1.y;
+    const key2 = pos2.x + ',' + pos2.y;
+
+    if (predicted[0].has(key1)) dangerScore += 100; // very likely collision next tick
+    if (predicted[1].has(key2)) dangerScore += 50;  // collision in two ticks
+    // check immediate current bodies (before movement)
+    for (const a of [...players, ...enemies]){
+      if (!a.alive || a === enemy) continue;
+      if (a.snake.some(seg => seg.x === pos1.x && seg.y === pos1.y)) dangerScore += 200; // immediate death
+    }
+
+    // head-head: if any other actor's predicted next head equals pos1, heavy penalty
+    // compute other actors' next heads
+    for (const a of [...players, ...enemies]){
+      if (!a.alive || a === enemy) continue;
+      const otherHead = a.snake[0];
+      const otherNext = { x: mod(otherHead.x + a.dir.x, GRID_COLS), y: mod(otherHead.y + a.dir.y, GRID_ROWS) };
+      if (otherNext.x === pos1.x && otherNext.y === pos1.y) dangerScore += 150;
+    }
+
+    // Blocked path detection: if both pos1 and pos2 are surrounded (few escape tiles), penalize
+    const escapes1 = countFreeNeighbors(pos1.x, pos1.y, enemy);
+    const escapes2 = countFreeNeighbors(pos2.x, pos2.y, enemy);
+    if (escapes1 <= 1) dangerScore += 30;
+    if (escapes2 === 0) dangerScore += 80;
+
+    // Score by distance to food (closer is better) but only if safe
+    const distToFood = distManhattan(pos1, food);
+    const foodScore = (GRID_COLS + GRID_ROWS) - distToFood; // larger is better
+
+    // Combine into final score: prefer low danger, then food proximity
+    const score = (foodScore * 1.0) - (dangerScore * 2.0);
+
+    // If candidate leads to immediate collision with current bodies, skip
+    if (dangerScore >= 200) {
+      // extremely unsafe, skip unless no safe moves
+      // still consider but with very low score
+    }
+
+    if (score > bestScore){
+      bestScore = score;
+      best = cand;
+    }
+  }
+
+  // If best is null (shouldn't happen), keep current dir
+  return best || enemy.dir;
+}
+
+// Count free neighbor tiles (not occupied now) around (x,y) excluding the tile occupied by `enemy`'s own body tail (since tail may move)
+function countFreeNeighbors(x,y,enemy){
+  let count = 0;
+  const neighbors = [{x:1,y:0},{x:-1,y:0},{x:0,y:1},{x:0,y:-1}];
+  for (const n of neighbors){
+    const nx = mod(x + n.x, GRID_COLS);
+    const ny = mod(y + n.y, GRID_ROWS);
+    // consider a tile free if no current snake segment occupies it (except possibly the tail of the moving snake)
+    let occupied = false;
+    for (const p of players) if (p.alive && p.snake.some(s => s.x === nx && s.y === ny)) { occupied = true; break; }
+    if (occupied) continue;
+    for (const e of enemies) if (e.alive && e !== enemy && e.snake.some(s => s.x === nx && s.y === ny)) { occupied = true; break; }
+    if (occupied) continue;
+    // if it's the enemy's own tail, it's considered free because tail will move
+    const tail = enemy.snake[enemy.snake.length - 1];
+    if (tail && tail.x === nx && tail.y === ny) {
+      count++; continue;
+    }
+    // otherwise free
+    count++;
+  }
+  return count;
+}
+
+/* -------------------------
+   Game update (single tick)
+   ------------------------- */
+function updateTick(){
+  if (!running) return;
+
+  // 1) Apply queued directions for players (no instant reverse)
+  for (const p of players){
+    if (!p.alive) continue;
+    if (!isOpposite(p.nextDir, p.dir)) p.dir = {...p.nextDir};
+  }
+
+  // 2) Update enemy directions via smarter AI
+  updateEnemyTargets();
+  for (const e of enemies){
+    if (!e.alive) continue;
+    // compute candidate direction using smarter chooser
+    const chosen = chooseEnemyDirection(e);
+    if (chosen && !isOpposite(chosen, e.dir)) e.nextDir = chosen;
+    if (!isOpposite(e.nextDir, e.dir)) e.dir = {...e.nextDir};
+  }
+
+  // 3) Compute new head positions for all alive actors
+  const actors = [...players, ...enemies];
+  const aliveActors = actors.filter(a => a.alive);
+  const newHeads = new Map(); // actor -> {x,y}
+  for (const a of aliveActors){
+    const head = a.snake[0];
+    newHeads.set(a, { x: mod(head.x + a.dir.x, GRID_COLS), y: mod(head.y + a.dir.y, GRID_ROWS) });
+  }
+
+  // 4) Collision detection rules (simultaneous movement)
+  const posMap = {};
+  for (const [actor,pos] of newHeads.entries()){
+    const key = pos.x + ',' + pos.y;
+    if (!posMap[key]) posMap[key] = [];
+    posMap[key].push(actor);
+  }
+
+  const toDie = new Set();
+
+  // Head-head collisions
+  for (const key in posMap){
+    const arr = posMap[key];
+    if (arr.length > 1){
+      for (const a of arr) toDie.add(a);
+    }
+  }
+
+  // Head -> other current body collisions
+  for (const [actor,pos] of newHeads.entries()){
+    if (toDie.has(actor)) continue;
+    for (const other of aliveActors){
+      if (other === actor) continue;
+      if (other.snake.some(seg => seg.x === pos.x && seg.y === pos.y)){
+        toDie.add(actor);
+        break;
+      }
+    }
+  }
+
+  // Self-collision (new head into own current body)
+  for (const [actor,pos] of newHeads.entries()){
+    if (toDie.has(actor)) continue;
+    if (actor.snake.some(seg => seg.x === pos.x && seg.y === pos.y)){
+      toDie.add(actor);
+    }
+  }
+
+  // 5) Apply deaths from collisions
+  for (const a of toDie){
+    a.alive = false;
+  }
+
+  // 6) If no snakes remain alive (players and enemies), end the game properly
+  const anyPlayerAlive = players.some(p => p.alive);
+  const anyEnemyAlive = enemies.some(e => e.alive);
+  if (!anyPlayerAlive && !anyEnemyAlive){
+    endGame(false, null);
+    return;
+  }
+
+  // 7) Move surviving actors: add new head, check food, pop tail if not eaten
+  let foodEatenBy = null;
+  for (const p of players){
+    if (!p.alive) continue;
+    const pos = newHeads.get(p);
+    p.snake.unshift(pos);
+    if (food && pos.x === food.x && pos.y === food.y){
+      p.eats += 1;
+      p.consecutiveEats += 1;
+      foodEatenBy = p;
+    } else {
+      p.snake.pop();
+      p.consecutiveEats = 0;
+    }
+  }
+  for (const e of enemies){
+    if (!e.alive) continue;
+    const pos = newHeads.get(e);
+    e.snake.unshift(pos);
+    if (food && pos.x === food.x && pos.y === food.y){
+      e.eats += 1;
+      e.consecutiveEats += 1;
+      foodEatenBy = foodEatenBy || e;
+    } else {
+      e.snake.pop();
+      e.consecutiveEats = 0;
+    }
+  }
+
+  // 8) If food eaten, spawn new food immediately
+  if (foodEatenBy){
+    placeFood();
+  }
+
+  // 9) Win condition: any player's snake covers 65% of total cells
+  const totalCells = GRID_COLS * GRID_ROWS;
+  for (const p of players){
+    if (p.alive && p.snake.length >= Math.ceil(0.65 * totalCells)){
+      endGame(true, p.id);
+      return;
+    }
+  }
+
+  // 10) Aggressive mode handling
+  handleAggro(foodEatenBy);
+
+  // 11) Update UI
+  updateScoreUI();
+}
+
+/* -------------------------
+   Aggressive mode logic
+   ------------------------- */
+function updateEnemyTargets(){
+  for (const e of enemies){
+    if (!e.alive) continue;
+    e.aggro = aggroActive;
+  }
+}
+
+function handleAggro(foodEatenBy){
+  const enemiesHaveEaten = enemies.some(e => e.eats > 0);
+  const triggeringPlayer = players.find(p => p.consecutiveEats > AGGRO_THRESHOLD);
+
+  if (!aggroActive && triggeringPlayer && !enemiesHaveEaten){
+    aggroActive = true;
+    aggroTimer = AGGRO_DURATION_MS;
+    aggroTriggerPlayerId = triggeringPlayer.id;
+    aggroPlayerEatsAtStart = triggeringPlayer.eats;
+    for (const e of enemies) e.aggro = true;
+  }
+
+  if (aggroActive){
+    const trigger = players.find(p => p.id === aggroTriggerPlayerId);
+    if (!trigger || (trigger.eats - aggroPlayerEatsAtStart) >= AGGRO_EXTRA_EATS_TO_END){
+      endAggro();
+      return;
+    }
+    if (aggroTimer <= 0){
+      endAggro();
+      return;
+    }
+  }
+}
+
+function endAggro(){
+  aggroActive = false;
+  aggroTimer = 0;
+  aggroTriggerPlayerId = null;
+  aggroPlayerEatsAtStart = 0;
+  for (const e of enemies) e.aggro = false;
+}
+
+/* -------------------------
+   Rendering
+   ------------------------- */
+function render(){
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+
+  ctx.strokeStyle = COLORS.gridLine;
+  ctx.lineWidth = 1;
+  for (let x=0;x<=GRID_COLS;x++){
+    ctx.beginPath();
+    ctx.moveTo(x*CELL_SIZE,0);
+    ctx.lineTo(x*CELL_SIZE,canvas.height);
+    ctx.stroke();
+  }
+  for (let y=0;y<=GRID_ROWS;y++){
+    ctx.beginPath();
+    ctx.moveTo(0,y*CELL_SIZE);
+    ctx.lineTo(canvas.width,y*CELL_SIZE);
+    ctx.stroke();
+  }
+
+  if (food){
+    ctx.fillStyle = COLORS.food;
+    drawCell(food.x, food.y);
+  }
+
+  for (const e of enemies){
+    if (!e.alive) continue;
+    const headColor = e.aggro ? COLORS.enemyGray : e.colorHead;
+    const bodyColor = e.aggro ? shadeColor(COLORS.enemyGray, -20) : e.colorBody;
+    for (let i=0;i<e.snake.length;i++){
+      const seg = e.snake[i];
+      ctx.fillStyle = (i===0) ? headColor : bodyColor;
+      drawCell(seg.x, seg.y);
+    }
+  }
+
+  for (const p of players){
+    if (!p.alive) continue;
+    for (let i=0;i<p.snake.length;i++){
+      const seg = p.snake[i];
+      ctx.fillStyle = (i===0) ? p.colorHead : p.colorBody;
+      drawCell(seg.x, seg.y);
+    }
+  }
+}
+
+function drawCell(gx,gy){
+  ctx.fillRect(gx*CELL_SIZE + 1, gy*CELL_SIZE + 1, CELL_SIZE - 2, CELL_SIZE - 2);
+}
+
+/* -------------------------
+   Main loop
+   ------------------------- */
+function gameLoop(timestamp){
+  if (!lastTime) lastTime = timestamp;
+  const delta = timestamp - lastTime;
+  lastTime = timestamp;
+
+  if (running){
+    moveTimer += delta;
+    if (aggroActive) aggroTimer -= delta;
+    if (moveTimer >= moveInterval){
+      moveTimer = 0;
+      updateTick();
+    }
+  }
+
+  render();
+  requestAnimationFrame(gameLoop);
+}
+
+/* -------------------------
+   Start / Stop / UI helpers
+   ------------------------- */
+function startGame(){
+  settingsLocked = true;
+  startBtn.disabled = true;
+  stopBtn.disabled = false;
+  enemyCountSelect.disabled = true;
+  modeSelect.disabled = true;
+  speedInput.disabled = true;
+
+  configureGrid();
+  moveInterval = speedToInterval(parseInt(speedInput.value,10));
+  resetGameState();
+
+  // Ensure enemies present if selected (robust spawn already handles this)
+  const desiredEnemyCount = parseInt(enemyCountSelect.value,10);
+  if (desiredEnemyCount > enemies.length){
+    // spawn missing enemies in free spots
+    const missing = desiredEnemyCount - enemies.length;
+    for (let i=0;i<missing;i++){
+      const alt = findSpawnForLength(3);
+      if (alt){
+        const id = enemies.length + 1;
+        enemies.push(createEnemy(id, alt.x, alt.y, alt.dir, COLORS.enemyColors[(id-1) % COLORS.enemyColors.length]));
+      } else {
+        // fallback: any free cell
+        for (let x=0;x<GRID_COLS;x++){
+          let placed = false;
+          for (let y=0;y<GRID_ROWS;y++){
+            if (isCellFree(x,y)){
+              const id = enemies.length + 1;
+              enemies.push(createEnemy(id, x, y, {x:-1,y:0}, COLORS.enemyColors[(id-1) % COLORS.enemyColors.length]));
+              placed = true; break;
+            }
+          }
+          if (placed) break;
+        }
+      }
+    }
+  }
+
+  running = true;
+  lastTime = 0;
+  moveTimer = 0;
+  overlay.style.display = 'none';
+}
+
+function stopGame(){
+  running = false;
+  settingsLocked = false;
+  startBtn.disabled = false;
+  stopBtn.disabled = true;
+  enemyCountSelect.disabled = false;
+  modeSelect.disabled = false;
+  speedInput.disabled = false;
+  overlay.style.display = 'flex';
+  overlay.textContent = 'Paused';
+}
+
+function endGame(playerWon, winnerId = null){
+  running = false;
+  settingsLocked = false;
+  startBtn.disabled = false;
+  stopBtn.disabled = true;
+  enemyCountSelect.disabled = false;
+  modeSelect.disabled = false;
+  speedInput.disabled = false;
+  overlay.style.display = 'flex';
+  if (playerWon){
+    overlay.textContent = `Player ${winnerId} Wins!`;
+  } else {
+    const alivePlayers = players.filter(p => p.alive).map(p => p.id);
+    if (alivePlayers.length === 1){
+      overlay.textContent = `Player ${alivePlayers[0]} Survived — Game Over`;
+    } else {
+      overlay.textContent = 'Game Over';
+    }
+  }
+}
+
+function updateScoreUI(){
+  score1El.textContent = players[0] ? players[0].eats : 0;
+  score2El.textContent = players[1] ? players[1].eats : 0;
+}
+
+function speedToInterval(speed){
+  return 350 - (speed - 1) * 30;
+}
+
+/* -------------------------
+   Event wiring
+   ------------------------- */
+startBtn.addEventListener('click', startGame);
+stopBtn.addEventListener('click', stopGame);
+
+speedInput.addEventListener('input', () => {
+  if (settingsLocked){
+    speedInput.value = speedInput.defaultValue;
+    return;
+  }
+  moveInterval = speedToInterval(parseInt(speedInput.value,10));
+});
+
+enemyCountSelect.addEventListener('change', () => {
+  if (settingsLocked){
+    enemyCountSelect.value = enemyCountSelect.defaultValue;
+  } else {
+    configureGrid();
+  }
+});
+
+modeSelect.addEventListener('change', () => {
+  if (settingsLocked){
+    modeSelect.value = modeSelect.defaultValue;
+  } else {
+    // grid will be reconfigured on start
+  }
+});
+
+/* -------------------------
+   Initialize and start render loop
+   ------------------------- */
+configureGrid();
+resetGameState();
+requestAnimationFrame(gameLoop);
+
+/* -------------------------
+   End of script
+   ------------------------- */
+  </script>
+</body>
+</html>
